@@ -1,18 +1,37 @@
+# src/kis_auth.py
 # -*- coding: utf-8 -*-
 import json
 import os
 import requests
 import yaml
-from datetime import datetime
+import time
+import threading  # threading 모듈 임포트
+from datetime import datetime, timedelta
 from collections import namedtuple
 
 # Docker 컨테이너 내부의 설정 파일 경로를 직접 지정합니다.
-CONFIG_ROOT = "/app/config" 
+CONFIG_ROOT = "/app/config"
 TOKEN_FILE = os.path.join(CONFIG_ROOT, f"KIS_token_{datetime.today().strftime('%Y%m%d')}")
 _TRENV = None
 _BASE_HEADERS = {"Content-Type": "application/json", "Accept": "text/plain", "charset": "UTF-8"}
 
+# 스레드 동기화를 위한 Lock 객체 생성
+_api_lock = threading.Lock()
+_last_api_call_time = 0
+
 # --- 내부 함수 ---
+
+def smart_sleep():
+    """API 호출 간격을 조절하여 rate limit을 피하기 위한 스레드 안전 함수"""
+    global _last_api_call_time
+    with _api_lock: # Lock을 사용하여 한 번에 하나의 스레드만 접근하도록 보장
+        elapsed = time.time() - _last_api_call_time
+        # KIS API는 초당 20회 제한이므로, 50ms(0.05초) 이상 간격을 두면 안전합니다.
+        # 안정성을 위해 0.1초(100ms)로 설정합니다.
+        if elapsed < 0.1:
+            time.sleep(0.1 - elapsed)
+        _last_api_call_time = time.time()
+
 def _save_token(token_data):
     """발급받은 토큰을 파일에 저장"""
     try:
@@ -43,7 +62,6 @@ def _is_token_valid(token_data):
 def _set_env(cfg, token):
     """환경변수 설정"""
     global _TRENV
-    # KISEnv namedtuple에 my_url 추가
     KISEnv = namedtuple("KISEnv", ["my_app", "my_sec", "my_acct", "my_prod", "my_url", "my_token", "my_htsid"])
     
     url_base = cfg['prod'] if cfg.get('svr') == 'prod' else cfg.get('vps')
@@ -146,6 +164,7 @@ def auth(svr="prod"):
 
 def _url_fetch(api_url, tr_id, tr_cont, params, postFlag=False):
     """API 호출 공통 함수"""
+    smart_sleep() # API 호출 전 지연 시간 추가
     if _TRENV is None:
         raise Exception("인증이 필요합니다. auth() 함수를 먼저 호출해주세요.")
 
@@ -167,5 +186,3 @@ def _url_fetch(api_url, tr_id, tr_cont, params, postFlag=False):
 
 def getTREnv():
     return _TRENV
-
-from datetime import timedelta # Import timedelta

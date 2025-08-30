@@ -1,5 +1,4 @@
-# kis_api/auth.py
-
+# -*- coding: utf-8 -*-
 import json
 import os
 import requests
@@ -7,10 +6,8 @@ import yaml
 from datetime import datetime
 from collections import namedtuple
 
-# --- 설정값 ---
-# 설정파일은 홈디렉토리 아래 KIS/config 폴더에 위치해야 합니다.
-# (예: /Users/사용자이름/KIS/config/kis_devlp.yaml)
-CONFIG_ROOT = os.path.join(os.path.expanduser("~"), "KIS", "config")
+# Docker 컨테이너 내부의 설정 파일 경로를 직접 지정합니다.
+CONFIG_ROOT = "/app/config" 
 TOKEN_FILE = os.path.join(CONFIG_ROOT, f"KIS_token_{datetime.today().strftime('%Y%m%d')}")
 _TRENV = None
 _BASE_HEADERS = {"Content-Type": "application/json", "Accept": "text/plain", "charset": "UTF-8"}
@@ -46,14 +43,19 @@ def _is_token_valid(token_data):
 def _set_env(cfg, token):
     """환경변수 설정"""
     global _TRENV
-    KISEnv = namedtuple("KISEnv", ["my_app", "my_sec", "my_acct", "my_prod", "my_url", "my_token"])
+    # KISEnv namedtuple에 my_url 추가
+    KISEnv = namedtuple("KISEnv", ["my_app", "my_sec", "my_acct", "my_prod", "my_url", "my_token", "my_htsid"])
+    
+    url_base = cfg['prod'] if cfg.get('svr') == 'prod' else cfg.get('vps')
+
     _TRENV = KISEnv(
         my_app=cfg["my_app"],
         my_sec=cfg["my_sec"],
         my_acct=cfg["my_acct_stock"],
         my_prod=cfg["my_prod"],
-        my_url=cfg["my_url"],
+        my_url=url_base,
         my_token=token,
+        my_htsid=cfg["my_htsid"]
     )
 
 def _get_base_header():
@@ -86,6 +88,9 @@ class APIResp:
 
     def getErrorMessage(self):
         return self._json.get("msg1")
+    
+    def getHeader(self):
+        return self._resp.headers
 
     def printError(self):
         print(f"API 오류: [{self.getErrorCode()}] {self.getErrorMessage()}")
@@ -106,34 +111,40 @@ def auth(svr="prod"):
     if _is_token_valid(token_data):
         print("기존 토큰이 유효하여 재사용합니다.")
         token = token_data['access_token']
-        url_key = 'prod_url' if svr == 'prod' else 'vps_url'
-        cfg['my_url'] = cfg[url_key]
+        cfg['svr'] = svr
         _set_env(cfg, token)
         return
 
     # 2. 신규 토큰 발급
     print("신규 토큰을 발급합니다.")
-    url_base = cfg['prod_url'] if svr == 'prod' else cfg['vps_url']
+    url_base = cfg['prod'] if svr == 'prod' else cfg['vps']
     url = f"{url_base}/oauth2/tokenP"
     
+    app_key = cfg["my_app"] if svr == "prod" else cfg["paper_app"]
+    app_secret = cfg["my_sec"] if svr == "prod" else cfg["paper_sec"]
+
     p = {
         "grant_type": "client_credentials",
-        "appkey": cfg["my_app"] if svr == "prod" else cfg["paper_app"],
-        "appsecret": cfg["my_sec"] if svr == "prod" else cfg["paper_sec"]
+        "appkey": app_key,
+        "appsecret": app_secret
     }
 
     res = requests.post(url, data=json.dumps(p), headers=_BASE_HEADERS)
     if res.status_code == 200:
         token_data = res.json()
+        token_data['access_token_token_expired'] = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         _save_token(token_data)
         token = token_data['access_token']
-        cfg['my_url'] = url_base
+        cfg['svr'] = svr
+        # app_key와 app_secret을 실전/모의에 맞게 설정
+        cfg['my_app'] = app_key
+        cfg['my_sec'] = app_secret
         _set_env(cfg, token)
         print("토큰 발급 성공!")
     else:
         print(f"토큰 발급 실패: {res.text}")
 
-def _url_fetch(api_url, tr_id, params):
+def _url_fetch(api_url, tr_id, tr_cont, params, postFlag=False):
     """API 호출 공통 함수"""
     if _TRENV is None:
         raise Exception("인증이 필요합니다. auth() 함수를 먼저 호출해주세요.")
@@ -141,11 +152,20 @@ def _url_fetch(api_url, tr_id, params):
     url = f"{_TRENV.my_url}{api_url}"
     headers = _get_base_header()
     headers["tr_id"] = tr_id
+    headers["tr_cont"] = tr_cont
     
-    res = requests.get(url, headers=headers, params=params)
+    if postFlag:
+        res = requests.post(url, headers=headers, data=json.dumps(params))
+    else:
+        res = requests.get(url, headers=headers, params=params)
     
     if res.status_code == 200:
         return APIResp(res)
     else:
         print(f"API 요청 실패: {res.status_code}, {res.text}")
         return None
+
+def getTREnv():
+    return _TRENV
+
+from datetime import timedelta # Import timedelta

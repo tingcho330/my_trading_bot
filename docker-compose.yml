@@ -4,9 +4,11 @@ services:
   trading_bot:
     build: .
     container_name: my_trading_bot_container
-    # config 폴더를 컨테이너 내부의 /app/config 경로에 연결(mount)합니다.
-    # 이렇게 하면 컨테이너 안의 코드가 바깥의 설정 파일을 읽을 수 있습니다.
     volumes:
       - ./src:/app
-      - ./config:/app/config # 이 부분을 추가/수정 하세요.
+      - ./config:/app/config
     restart: always
+    # ⬇️ 이 부분을 추가해주세요.
+    # 이 명령은 Dockerfile의 CMD를 덮어쓰고,
+    # 컨테이너가 꺼지지 않고 계속 대기하도록 만듭니다.
+    command: sleep infinity

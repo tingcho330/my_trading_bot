@@ -1,86 +1,48 @@
-# main.py
-
-import kis_api
-import yaml
+# src/main.py
 import os
-import logging
+import sys
+import pprint
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# 현재 파일의 경로를 sys.path에 추가하여 모듈 임포트 경로를 설정
+# 이렇게 해야 Docker 컨테이너에서도 kis_auth와 domestic_stock_functions를 찾을 수 있음
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
-def get_account_info():
-    """
-    설정 파일에서 계좌 정보를 읽어옵니다.
-    이 함수는 설정 파일이 있는 경우에만 동작합니다.
-    """
-    config_path = os.path.join(os.path.expanduser("~"), "KIS", "config", "kis_devlp.yaml")
-    try:
-        with open(config_path, 'r', encoding='UTF-8') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
-        
-        # 'my_acct_stock'과 'my_prod' 키가 있는지 확인
-        if 'my_acct_stock' in config and 'my_prod' in config:
-            cano = config['my_acct_stock']
-            acnt_prdt_cd = config['my_prod']
-            return cano, acnt_prdt_cd
-        else:
-            logging.error("'my_acct_stock' 또는 'my_prod'를 설정 파일에서 찾을 수 없습니다.")
-            return None, None
-            
-    except FileNotFoundError:
-        logging.error(f"설정 파일을 찾을 수 없습니다: {config_path}")
-        return None, None
-    except Exception as e:
-        logging.error(f"설정 파일 로딩 중 오류 발생: {e}")
-        return None, None
+import kis_auth as ka
+from domestic_stock import domestic_stock_functions as ds
 
+# 'prod' (실전투자) 또는 'vps' (모의투자) 중 선택
+# kis_devlp.yaml 파일에 설정된 값에 따라 자동으로 올바른 서버에 접속합니다.
+ka.auth(svr='prod')
 
-def main():
-    """
-    메인 실행 함수
-    """
-    # 1. API 인증
-    kis_api.auth()
-    
-    # 2. 계좌 정보 가져오기
-    # TODO: kis_devlp.yaml 파일에 본인의 계좌번호 8자리(my_acct_stock)와
-    # 상품코드 2자리(my_prod)를 정확히 입력해주세요.
-    cano, acnt_prdt_cd = get_account_info()
-    
-    if not cano or not acnt_prdt_cd:
-        logging.error("계좌정보를 가져오지 못했습니다. 프로그램을 종료합니다.")
-        return
+def check_my_account():
+    """ domestic_stock_functions.py에 정의된 주식 잔고 조회 함수를 호출합니다. """
+    # inquire_balance 함수의 파라미터는 KIS API 명세를 참고하여 필요한 값으로 설정합니다.
+    # 예시: 실전투자, 종합계좌, 시간외단일가 미포함, 종목별 조회 등
+    trenv = ka.getTREnv()
+    df1, df2 = ds.inquire_balance(
+        env_dv="real", # 실전
+        cano=trenv.my_acct,           # 계좌번호 앞 8자리
+        acnt_prdt_cd=trenv.my_prod,   # 계좌번호 뒤 2자리
+        afhr_flpr_yn="N",
+        inqr_dvsn="02",
+        unpr_dvsn="01",
+        fund_sttl_icld_yn="N",
+        fncg_amt_auto_rdpt_yn="N",
+        prcs_dvsn="00"
+    )
 
-    # 3. 보유 종목 조회
-    logging.info("\n--- 보유 종목 조회 시작 ---")
-    holdings_df, _ = kis_api.inquire_holdings(cano, acnt_prdt_cd)
-    
-    if not holdings_df.empty:
-        # 원하는 컬럼만 선택하여 출력
-        cols_to_show = ['prdt_name', 'hldg_qty', 'pchs_avg_pric', 'evlu_amt', 'evlu_pfls_rt']
-        print(holdings_df[cols_to_show])
+    if not df1.empty:
+        print("--- 보유 주식 목록 ---")
+        pprint.pprint(df1.to_dict('records'))
     else:
-        print("보유 종목이 없습니다.")
-    logging.info("--- 보유 종목 조회 완료 ---\n")
+        print("보유 주식이 없습니다.")
 
-    # 4. 계좌 총자산 현황 조회
-    logging.info("--- 계좌 총자산 현황 조회 시작 ---")
-    _, summary_df = kis_api.inquire_total_balance(cano, acnt_prdt_cd)
-    
-    if not summary_df.empty:
-        # 원하는 컬럼만 선택하여 출력
-        cols_to_show = ['nass_tot_amt', 'evlu_pfls_amt_smtl', 'tot_evlu_amt', 'pchs_amt_smtl']
-        # 컬럼 이름 변경
-        summary_df.rename(columns={
-            'nass_tot_amt': '순자산총액',
-            'evlu_pfls_amt_smtl': '총평가손익',
-            'tot_evlu_amt': '총평가금액',
-            'pchs_amt_smtl': '총매입금액'
-        }, inplace=True)
-        print(summary_df[summary_df.columns.intersection(cols_to_show)]) # 변경된 이름으로 출력
+    if not df2.empty:
+        print("\n--- 계좌 종합 정보 ---")
+        pprint.pprint(df2.to_dict('records')[0])
     else:
-        print("계좌 총자산 현황을 조회할 수 없습니다.")
-    logging.info("--- 계좌 총자산 현황 조회 완료 ---")
+        print("계좌 종합 정보를 가져오지 못했습니다.")
 
 if __name__ == "__main__":
-    main()
+    print("계좌 조회를 시작합니다.")
+    check_my_account()

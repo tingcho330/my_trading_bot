@@ -1,0 +1,28 @@
+// .devcontainer/devcontainer.json
+{
+    "name": "My Trading Bot Environment",
+
+    // 기존의 docker-compose.yml 파일을 개발 환경 구성에 사용합니다.
+    "dockerComposeFile": [
+        "../docker-compose.yml"
+    ],
+
+    // docker-compose.yml 파일 안의 여러 서비스 중 'trading_bot' 서비스를
+    // 개발 환경의 베이스로 사용합니다.
+    "service": "trading_bot",
+
+    // Dev Container로 접속했을 때 기본적으로 열릴 폴더 경로입니다.
+    // Dockerfile에서 WORKDIR를 /app으로 설정했으므로 동일하게 맞춰줍니다.
+    "workspaceFolder": "/app",
+
+    // 컨테이너가 생성될 때 자동으로 설치할 VS Code 확장 프로그램 목록입니다.
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.pylance",
+                "ms-azuretools.vscode-docker"
+            ]
+        }
+    }
+}

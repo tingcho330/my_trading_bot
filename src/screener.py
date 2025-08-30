@@ -36,9 +36,9 @@ def stage(name: str):
 
 # ───────────────────────────── 경로/상수 ─────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-CWD = Path.cwd()
-OUTPUT_DIR = PROJECT_ROOT / "output"
+CWD = Path.cwd() # Docker의 WORKDIR인 /app을 가리킵니다.
+PROJECT_ROOT = CWD # 프로젝트의 루트를 CWD(/app)으로 설정합니다.
+OUTPUT_DIR = PROJECT_ROOT / "output" # 최종 경로는 /app/output이 됩니다.
 
 # ───────────────────────────── 캐시 (패치 1) ─────────────────────────────
 CACHE_DIR = OUTPUT_DIR / "cache"
@@ -853,23 +853,23 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         full_json  = OUTPUT_DIR / f"screener_full_{fixed_date}_{market}.json"
-        full_csv   = OUTPUT_DIR / f"screener_full_{fixed_date}_{market}.csv"
         final_json = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
-        final_csv  = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.csv"
 
         df_sorted.to_json(full_json, orient='records', indent=2, force_ascii=False)
         final_candidates.to_json(final_json, orient='records', indent=2, force_ascii=False)
         try:
             df_sorted.to_csv(full_csv, index=False)
             final_candidates.to_csv(final_csv, index=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"CSV 파일 저장 중 오류 발생: {e}")
 
         logger.info("전체 랭킹 저장: %s (%s)", full_json, _fsize(full_json))
         logger.info("✅ 스크리닝 완료. %d개 후보 저장: %s (%s)",
                     len(final_candidates), final_json, _fsize(final_json))
 
     logger.info("총 소요 시간: %.2fs", time.perf_counter() - t0)
+    # 실제 사용된 날짜(fixed_date)를 반환하도록 이 줄을 추가합니다.
+    return fixed_date
 
 # ─────────────────────────────── CLI ─────────────────────────────
 def parse_args():

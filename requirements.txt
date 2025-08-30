@@ -8,3 +8,9 @@ pycryptodome>=3.10.0
 numpy>=1.21.0
 pykrx>=1.0.45
 finance-datareader>=0.9.90
+
+# 뉴스 스크래핑을 위한 라이브러리 추가
+beautifulsoup4>=4.9.0
+python-dotenv>=0.15.0
+
+openai>=1.35.3

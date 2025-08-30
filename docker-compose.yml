@@ -2,11 +2,11 @@ services:
   trading_bot:
     build: .
     container_name: my_trading_bot_container
+    env_file: # 이 부분을 추가해주세요
+      - .env  # 프로젝트 루트에 있는 .env 파일을 읽어 환경변수로 설정합니다.
     volumes:
       - ./src:/app
       - ./config:/app/config
+      - ./output:/app/output
     restart: always
-    # ⬇️ 이 부분을 추가해주세요.
-    # 이 명령은 Dockerfile의 CMD를 덮어쓰고,
-    # 컨테이너가 꺼지지 않고 계속 대기하도록 만듭니다.
     command: sleep infinity

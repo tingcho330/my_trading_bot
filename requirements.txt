@@ -1,6 +1,10 @@
-# requirements.txt
+# KIS API 연동에 필요한 기본 라이브러리
+pandas==2.2.2
+requests>=2.25.0
+PyYAML>=6.0
+pycryptodome>=3.10.0
 
-pandas
-requests
-PyYAML
-pycryptodome
+# KIS API 비사용 스크리너용 라이브러리
+numpy>=1.21.0
+pykrx>=1.0.45
+finance-datareader>=0.9.90

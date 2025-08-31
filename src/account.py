@@ -10,7 +10,7 @@ from api.kis_auth import KIS
 # ───────────────── 경로 설정 ─────────────────
 # 요청대로 /app/out 디렉터리에 저장
 CONFIG_PATH = Path("/app/config/config.json")
-OUTPUT_DIR = Path("/app/out")
+OUTPUT_DIR = Path("/app/output")
 COOLDOWN_FILE = OUTPUT_DIR / "cooldown.json"  # (미사용 시에도 경로 유지)
 
 

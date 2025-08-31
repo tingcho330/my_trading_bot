@@ -14,9 +14,8 @@ import pandas as pd
 import FinanceDataReader as fdr
 from pykrx import stock as pykrx
 
-# KIS API 모듈
-import kis_auth as ka
-from domestic_stock import domestic_stock_functions as ds
+# KIS API 모듈 임포트 경로 및 방식 수정
+from api.kis_auth import KIS
 
 # ───────────────────────────── 기본 설정 ─────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -91,7 +90,6 @@ def _build_config_candidates(cli_path: Optional[str]) -> List[Path]:
         Path("/app/config/config.json"),
     ]
     return [p.resolve() for p in candidates if p.exists()]
-
 
 def load_settings(config_path: Optional[str]) -> Dict[str, Any]:
     cands = _build_config_candidates(config_path)
@@ -361,15 +359,18 @@ def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
                 return code_map[code]
     return None
 
-def _get_kis_sector_map(codes: List[str], prdt_type_cd: str = "300", cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
+# ─────────────────── KIS API 호출 로직 수정 ───────────────────
+def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
     if cache_key:
         cached = _cache_load('kis_sector_map', cache_key)
         if isinstance(cached, dict) and cached:
             logger.info("kis 섹터맵 캐시 사용: %s", _cache_path('kis_sector_map', cache_key).name)
             return cached
+
     def _fetch_one(code: str) -> Tuple[str, str]:
         try:
-            df = ds.inquire_price(env_dv="real", fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
+            # KIS 인스턴스를 통해 API 호출 (수정됨)
+            df = kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
             if df is not None and not df.empty:
                 sec = _extract_sector_from_kis_df(df)
                 return (str(code).zfill(6), _normalize_sector_name(sec) if sec else "N/A")
@@ -377,6 +378,7 @@ def _get_kis_sector_map(codes: List[str], prdt_type_cd: str = "300", cache_key: 
         except Exception as e:
             logger.debug("KIS 섹터 조회 실패(%s): %s", code, e)
             return (str(code).zfill(6), "N/A")
+
     sectors: Dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         futs = {ex.submit(_fetch_one, c): c for c in codes}
@@ -390,7 +392,7 @@ def _get_kis_sector_map(codes: List[str], prdt_type_cd: str = "300", cache_key: 
         _cache_save('kis_sector_map', cache_key, sectors)
     return sectors
 
-def _enrich_sector_with_kis_api(df_base: pd.DataFrame, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
+def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
     if df_base is None or df_base.empty:
         out = df_base.copy(); out['Sector'] = out.get('Sector', "N/A"); return out
     out = df_base.copy()
@@ -400,7 +402,8 @@ def _enrich_sector_with_kis_api(df_base: pd.DataFrame, workers: int, cache_key: 
     if len(target_idx) == 0: logger.info("KIS 보강 대상 없음."); return out
     logger.info("KIS(inquire_price) 섹터 보강 시작 (대상 %d종목)", len(target_idx))
     ck = cache_key or datetime.now().strftime("%Y%m%d")
-    kis_map = _get_kis_sector_map([str(x).zfill(6) for x in target_idx.tolist()], "300", ck, workers)
+    # kis 인스턴스를 전달하도록 수정
+    kis_map = _get_kis_sector_map([str(x).zfill(6) for x in target_idx.tolist()], kis, ck, workers)
     out.loc[target_idx, "Sector"] = out.loc[target_idx].index.to_series().map(kis_map).values
     out["Sector"] = out["Sector"].map(_normalize_sector_name).fillna("N/A").astype("object")
     logger.info("✅ KIS(inquire_price) 섹터 정보 보강 완료.")
@@ -507,7 +510,7 @@ def _calculate_sector_trends(date_str: str) -> Dict[str, float]:
     _cache_save("sector_trends", date_str, sector_trends)
     return sector_trends
 
-def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers: int, date_str: str, market: str) -> pd.DataFrame:
+def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], kis: KIS, workers: int, date_str: str, market: str) -> pd.DataFrame:
     df = df_base.copy()
     if "Sector" not in df.columns: df["Sector"] = np.nan
     df["Sector"] = df["Sector"].astype("object")
@@ -527,7 +530,7 @@ def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers:
             _log_sector_summary(df, "pykrx 매핑 후")
         elif src == "kis":
             logger.info("섹터 보강(KIS) 대상: %d 종목", len(missing_idx))
-            kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), workers, cache_key=date_str)
+            kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), kis, workers, cache_key=date_str)
             kis_df["Sector"] = kis_df["Sector"].astype("object")
             df.loc[missing_idx, "Sector"] = kis_df.loc[missing_idx, "Sector"]
             df.loc[missing_idx, "SectorSource"] = np.where(kis_df.loc[missing_idx, "Sector"].notna(), "kis", df.loc[missing_idx, "SectorSource"])
@@ -701,7 +704,14 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         logger.error("설정 로딩 실패로 종료합니다.")
         return
 
-    ka.auth(svr='prod')
+    # KIS 클래스 인스턴스화 (수정됨)
+    broker_config = settings.get("kis_broker", {})
+    trading_env = settings.get("trading_environment", "mock")
+    kis = KIS(broker_config, env=trading_env)
+    if not kis.auth_token:
+        logger.error("KIS API 인증 실패로 종료합니다.")
+        return
+    logger.info(f"'{trading_env}' 모드로 KIS API 인증 완료.")
 
     screener_params = settings.get("screener_params", {})
     risk_params     = settings.get("risk_params", {})
@@ -713,7 +723,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             return
     with stage("섹터 보강"):
         order = screener_params.get("sector_source_priority", ["pykrx", "kis", "fdr"])
-        df_filtered = _apply_sector_source_order(df_filtered, order, workers, fixed_date, market)
+        # kis 인스턴스 전달
+        df_filtered = _apply_sector_source_order(df_filtered, order, kis, workers, fixed_date, market)
 
     with stage("시장 레짐 계산"):
         regime = _get_market_regime_score(fixed_date, market)

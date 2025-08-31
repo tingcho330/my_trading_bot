@@ -31,7 +31,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # ────────── KIS 모듈 ──────────
 sys.path.append('./src')
-import kis_auth as ka
+import src.api.kis_auth as ka
 from domestic_stock import domestic_stock_functions as ds
 
 # ────────── 섹터 정규화 ──────────

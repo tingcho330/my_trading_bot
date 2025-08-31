@@ -1,5 +1,3 @@
-# src/screener.py
-
 import os
 import json
 import logging
@@ -36,15 +34,21 @@ def stage(name: str):
 
 # ───────────────────────────── 경로/상수 ─────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-CWD = Path.cwd() # Docker의 WORKDIR인 /app을 가리킵니다.
-PROJECT_ROOT = CWD # 프로젝트의 루트를 CWD(/app)으로 설정합니다.
-OUTPUT_DIR = PROJECT_ROOT / "output" # 최종 경로는 /app/output이 됩니다.
+CWD = Path.cwd()  # Docker의 WORKDIR인 /app
+PROJECT_ROOT = CWD
+OUTPUT_DIR = PROJECT_ROOT / "output"  # 최종 경로는 /app/output
 
 # ───────────────────────────── 캐시 (패치 1) ─────────────────────────────
 CACHE_DIR = OUTPUT_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _cache_path(name: str, date_str: str) -> Path:
+    """
+    캐시 파일 경로 규칙(중요):
+    - 파일명은 '{name}_{date_str}.pkl'
+    - name에는 날짜를 포함하지 말 것. (중복 방지)
+      예: name='kis_sector_map', date_str='20250829' -> 'kis_sector_map_20250829.pkl'
+    """
     return CACHE_DIR / f"{name}_{date_str}.pkl"
 
 def _cache_load(name: str, date_str: str):
@@ -262,7 +266,7 @@ def detect_yey_pattern(df: pd.DataFrame) -> bool:
     is_reversal = d0['Close'] > d2['Close']
     return is_yang2 and is_eum1 and is_yang0 and is_reversal
 
-# ─────────────────────────── 섹터 관련 (패치 2/3 반영) ───────────────────────────
+# ─────────────────────────── 섹터 관련 ───────────────────────────
 def _normalize_sector_name(x: Optional[str]) -> str:
     if not x or str(x).strip().upper() in {"", "NAN", "NA", "N/A"}:
         return "N/A"
@@ -281,38 +285,119 @@ def _normalize_sector_name(x: Optional[str]) -> str:
             return v
     return s
 
-def _enrich_sector_with_kis_api(df_base: pd.DataFrame, workers: int) -> pd.DataFrame:
-    logger.info("KIS API를 통해 섹터 정보 조회 시작...")
-    sectors = {}
-    total = len(df_base)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_code = {
-            executor.submit(ds.search_stock_info, prdt_type_cd="300", pdno=code): code
-            for code in df_base.index
-        }
-        for i, future in enumerate(as_completed(future_to_code), start=1):
-            code = future_to_code[future]
-            if i % 10 == 0 or i == total:
-                logger.info("  >> 섹터 조회 진행률: %d/%d (%.1f%%)", i, total, i * 100.0 / total)
-            try:
-                result_df = future.result()
-                if result_df is not None and not result_df.empty and 'sect_kr_nm' in result_df.columns:
-                    sector_name = str(result_df['sect_kr_nm'].iloc[0]).strip()
-                    sectors[code] = _normalize_sector_name(sector_name) if sector_name else "N/A"
-                else:
-                    sectors[code] = "N/A"
-            except Exception as e:
-                logger.debug("%s: 섹터 정보 조회 실패 - %s", code, e)
-                sectors[code] = "N/A"
+def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
+    """
+    KIS 응답 DF에서 섹터명 후보 컬럼을 우선순위로 추출.
+    - inquire_price 기준: 'bstp_kor_isnm' (업종 한글명)
+    - (참고) 다른 API라면 'sect_kr_nm' 등도 있을 수 있음
+    """
+    if df is None or df.empty:
+        return None
+
+    for col in ["sect_kr_nm", "bstp_kor_isnm", "bstp_kor_isnm_nm", "induty_kor_isnm"]:
+        if col in df.columns:
+            val = str(df[col].iloc[0]).strip()
+            if val and val.upper() not in {"N/A", "NONE"}:
+                return val
+
+    # 코드만 있는 응답을 최소 매핑(현재 필요 시 확장)
+    code_cols = ["bstp_cls_code", "std_idst_clsf_cd"]
+    for col in code_cols:
+        if col in df.columns:
+            code = str(df[col].iloc[0]).strip()
+            code_map = {
+                "01": "제조",
+                "10": "금융",
+                "15": "IT서비스",
+            }
+            if code in code_map:
+                return code_map[code]
+    return None
+
+# ─────────── KIS(inquire_price) 기반 섹터 맵(캐시/병렬) ───────────
+def _get_kis_sector_map(codes: List[str], prdt_type_cd: str = "300",
+                        cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
+    """
+    inquire_price에서 섹터명(bstp_kor_isnm 등)을 읽어 티커→섹터 매핑 생성.
+    캐시 키(일자)를 주면 캐시 사용.
+    [중요] 캐시 파일명 중복 방지: name='kis_sector_map' 고정 + date_str=cache_key
+    """
+    # 캐시 조회: 파일명 규칙을 표준화 (중복 날짜 방지)
+    if cache_key:
+        cached = _cache_load('kis_sector_map', cache_key)
+        if isinstance(cached, dict) and cached:
+            logger.info("kis 섹터맵 캐시 사용: %s",
+                        _cache_path('kis_sector_map', cache_key).name)
+            return cached
+
+    def _fetch_one(code: str) -> Tuple[str, str]:
+        try:
+            # 섹터만 필요하므로 inquire_price만 사용
+            df = ds.inquire_price(
+                env_dv="real",
+                fid_cond_mrkt_div_code="J",
+                fid_input_iscd=str(code).zfill(6)
+            )
+            if df is not None and not df.empty:
+                sec = _extract_sector_from_kis_df(df)
+                return (str(code).zfill(6), _normalize_sector_name(sec) if sec else "N/A")
+            return (str(code).zfill(6), "N/A")
+        except Exception as e:
+            logger.debug("KIS 섹터 조회 실패(%s): %s", code, e)
+            return (str(code).zfill(6), "N/A")
+
+    sectors: Dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(_fetch_one, c): c for c in codes}
+        total = len(codes)
+        for i, fut in enumerate(as_completed(futs), start=1):
+            k, v = fut.result()
+            sectors[k] = v
+            if i % 20 == 0 or i == total:
+                logger.info("  >> KIS(inquire_price) 섹터 조회 진행: %d/%d (%.1f%%)", i, total, i * 100.0 / total)
+
+    # 캐시 저장 (표준화된 이름 사용)
+    if cache_key:
+        _cache_save('kis_sector_map', cache_key, sectors)
+    return sectors
+
+def _enrich_sector_with_kis_api(df_base: pd.DataFrame, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
+    """
+    KIS inquire_price로 섹터명을 채움.
+    - 스레드 풀 병렬 호출 + 캐시 지원
+    """
+    if df_base is None or df_base.empty:
+        out = df_base.copy()
+        out['Sector'] = out.get('Sector', "N/A")
+        return out
+
     out = df_base.copy()
-    out['Sector'] = out.index.map(sectors).fillna("N/A")
-    logger.info("✅ KIS API 섹터 정보 조회 완료.")
+    if "Sector" not in out.columns:
+        out["Sector"] = np.nan
+    out["Sector"] = out["Sector"].astype("object")
+
+    target_idx = out.index[out["Sector"].isna() | out["Sector"].eq("N/A")]
+    if len(target_idx) == 0:
+        logger.info("KIS 보강 대상 없음.")
+        return out
+
+    logger.info("KIS(inquire_price) 섹터 보강 시작 (대상 %d종목)", len(target_idx))
+    ck = cache_key or datetime.now().strftime("%Y%m%d")
+    kis_map = _get_kis_sector_map(
+        [str(x).zfill(6) for x in target_idx.tolist()],
+        prdt_type_cd="300",
+        cache_key=ck,
+        workers=workers
+    )
+
+    out.loc[target_idx, "Sector"] = out.loc[target_idx].index.to_series().map(kis_map).values
+    out["Sector"] = out["Sector"].map(_normalize_sector_name).fillna("N/A").astype("object")
+    logger.info("✅ KIS(inquire_price) 섹터 정보 보강 완료.")
     return out
 
 def _enrich_sector_with_fdr_krx(df_base: pd.DataFrame, market: str = "KOSPI") -> pd.DataFrame:
     out = df_base.copy()
     try:
-        # 1순위: 요청 시장별 Listing (KOSPI/KOSDAQ/KONEX)
         dfs = []
         try:
             df_mkt = fdr.StockListing(market)
@@ -324,7 +409,6 @@ def _enrich_sector_with_fdr_krx(df_base: pd.DataFrame, market: str = "KOSPI") ->
         except Exception as e:
             logger.debug("FDR %s listing 실패: %s", market, e)
 
-        # 2순위: KRX 전체
         try:
             df_krx = fdr.StockListing("KRX")
             if "Code" in df_krx.columns:
@@ -344,16 +428,13 @@ def _enrich_sector_with_fdr_krx(df_base: pd.DataFrame, market: str = "KOSPI") ->
         base = pd.concat(dfs, axis=0)
         base = base[~base.index.duplicated(keep="first")]
 
-        # 우선순위: Sector -> Industry
         cand_cols = [c for c in ["Sector", "Industry"] if c in base.columns]
         if not cand_cols:
             out["Sector"] = out.get("Sector", "N/A").fillna("N/A")
             out["Sector"] = out["Sector"].map(_normalize_sector_name)
             return out
 
-        # join
         joined = out.join(base[cand_cols], how="left")
-        # 우선 'Sector' 사용, 없으면 'Industry'
         if "Sector" in joined.columns and "Industry" in joined.columns:
             joined["Sector"] = joined["Sector"].fillna(joined["Industry"])
         elif "Sector" not in joined.columns and "Industry" in joined.columns:
@@ -380,7 +461,7 @@ def _log_sector_summary(df: pd.DataFrame, label: str):
     logger.info("섹터 요약(%s): 고유=%d, N/A=%d (%.1f%%), TOP5=%s",
                 label, len(vc), na, ratio, vc.head(5).to_dict())
 
-# 캐시 적용된 pykrx 섹터 맵/트렌드 (패치 3)
+# 캐시 적용된 pykrx 섹터 맵/트렌드
 def _get_pykrx_ticker_sector_map(date_str: str) -> Dict[str, str]:
     cached = _cache_load("pykrx_sector_map", date_str)
     if cached is not None:
@@ -432,15 +513,12 @@ def _calculate_sector_trends(date_str: str) -> Dict[str, float]:
     _cache_save("sector_trends", date_str, sector_trends)
     return sector_trends
 
-# 섹터 우선순위 적용(패치 4 제외 버전: 순서 제어만 추가)
-# 기존 시그니처 유지 가능하지만 market도 넘겨쓰려면 아래처럼 추가
+# 섹터 우선순위 적용
 def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers: int, date_str: str, market: str) -> pd.DataFrame:
     df = df_base.copy()
-    # dtype 명시
     if "Sector" not in df.columns:
         df["Sector"] = np.nan
     df["Sector"] = df["Sector"].astype("object")
-    # 선택: 섹터가 어디서 채워졌는지 추적(디버깅용)
     if "SectorSource" not in df.columns:
         df["SectorSource"] = pd.Series(index=df.index, dtype="object")
 
@@ -448,6 +526,8 @@ def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers:
     order_norm = [s for s in order_norm if s in {"pykrx", "kis", "fdr"}]
     if not order_norm:
         order_norm = ["pykrx", "kis", "fdr"]
+
+    logger.info("섹터 소스 우선순위: %s", order_norm)
 
     for src in order_norm:
         missing_idx = df.index[df["Sector"].isna() | df["Sector"].eq("N/A")]
@@ -463,8 +543,7 @@ def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers:
             _log_sector_summary(df, "pykrx 매핑 후")
         elif src == "kis":
             logger.info("섹터 보강(KIS) 대상: %d 종목", len(missing_idx))
-            kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), workers)
-            # dtype 보호
+            kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), workers, cache_key=date_str)
             kis_df["Sector"] = kis_df["Sector"].astype("object")
             df.loc[missing_idx, "Sector"] = kis_df.loc[missing_idx, "Sector"]
             df.loc[missing_idx, "SectorSource"] = np.where(
@@ -474,7 +553,7 @@ def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], workers:
         elif src == "fdr":
             logger.info("섹터 보강(FDR) 대상: %d 종목", len(missing_idx))
             fdr_df = _enrich_sector_with_fdr_krx(df.loc[missing_idx].copy(), market=market)
-            fdr_df["Sector"] = fdr_df["Sector"].astype("object")  # <<< 여기!
+            fdr_df["Sector"] = fdr_df["Sector"].astype("object")
             df.loc[missing_idx, "Sector"] = fdr_df.loc[missing_idx, "Sector"]
             df.loc[missing_idx, "SectorSource"] = np.where(
                 fdr_df.loc[missing_idx, "Sector"].notna(), "fdr", df.loc[missing_idx, "SectorSource"]
@@ -683,7 +762,7 @@ def _calculate_scores_for_ticker(
             sector_score * sector_w +
             pattern_score * pattern_w
         )
-        total_score = float(np.clip(total_score, 0.0, 1.0))  # 패치 5: 클리핑
+        total_score = float(np.clip(total_score, 0.0, 1.0))  # 점수 클리핑
 
         return {
             "Ticker": code,
@@ -701,14 +780,21 @@ def _calculate_scores_for_ticker(
             "YEY": bool(yey),
             "PER": round(float(per_val), 2) if pd.notna(per_val) else None,
             "PBR": round(float(pbr_val), 2) if pd.notna(pbr_val) else None,
-            "RSI": round(float(rsi), 2)
+            "RSI": round(float(rsi), 2),
+            "MA50": round(float(ma50), 2),
+            "MA200": round(float(ma200), 2)
         }
     except Exception as ex:
         logger.debug("[%s] 스코어 계산 예외: %s", code, ex)
         return None
 
-# ─────────────────────────── 섹터 다양화 (패치 5) ───────────────────────────
+# ─────────────────────────── 섹터 다양화 ───────────────────────────
 def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) -> pd.DataFrame:
+    """
+    섹터 다양화 규칙:
+    - sector_cap ∈ [0,1]라 가정, 섹터당 최대 편입수 = ceil(top_n * sector_cap), 최소 1
+    - 규칙에 맞춰 앞에서부터 차례대로 선별
+    """
     if top_n <= 0 or df_sorted.empty:
         return df_sorted.iloc[0:0]
     if sector_cap <= 0:
@@ -783,9 +869,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             return
 
     with stage("섹터 보강"):
+        # 설정 없으면 기본 ['pykrx','KIS','FDR'] → config에서 kis 우선이면 ['kis','pykrx'] 등으로 들어옴
         order = settings.get("screener_params", {}).get("sector_source_priority", ["pykrx", "KIS", "FDR"])
-        df_filtered = _apply_sector_source_order(df_filtered, order, workers, fixed_date, market)  # market 인자 추가
-
+        df_filtered = _apply_sector_source_order(df_filtered, order, workers, fixed_date, market)
 
     with stage("시장 레짐 계산"):
         regime = _get_market_regime_score(fixed_date, market)
@@ -824,26 +910,32 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     with stage("결과 정렬/다양화/저장"):
         df_scores = pd.DataFrame(results).set_index("Ticker")
-        df_scores = df_scores.drop(columns=["Sector"], errors="ignore")  # 충돌 방지
+        df_scores = df_scores.drop(columns=["Sector"], errors="ignore")
 
         df_filtered_no_dup = df_filtered.drop(columns=['PER', 'PBR'], errors='ignore')
         df_final = df_filtered_no_dup.join(df_scores, how="inner").reset_index().rename(columns={"index": "Ticker"})
         df_sorted = df_final.sort_values("Score", ascending=False)
 
+        # 최종 편입 수(top_n)는 risk.max_positions와 screener.top_n 중 작은 값
         top_n = min(int(screener_params.get("top_n", 10)), int(risk_params.get("max_positions", 10)))
+
+        # [제안 1 반영] 다양화 규칙을 로그로 명확히 출력
+        max_per_sector = max(1, int(np.ceil(top_n * float(sector_cap))))
+        logger.info("섹터 다양화 규칙: top_n=%d, sector_cap=%.2f → 섹터당 최대 %d개", top_n, sector_cap, max_per_sector)
+
         final_candidates = diversify_by_sector(df_sorted, top_n, sector_cap)
         final_candidates = final_candidates.head(top_n)
 
-        cols = ["Ticker","Name","Sector","Price","Score",
+        cols = ["Ticker","Name","Sector","Price","MA50","MA200","Score",
                 "FinScore","TechScore","MktScore","SectorScore","PatternScore",
                 "MA20Up","AccumVol","HigherLows","Consolidation","YEY",
-                "PER","PBR","RSI","Marcap","Amount5D"]
+                "PER","PBR","RSI","Marcap","Amount5D","SectorSource"]
         keep = [c for c in cols if c in df_sorted.columns]
         df_sorted = df_sorted[keep + [c for c in df_sorted.columns if c not in keep]]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]
 
         to_show = final_candidates.copy()
-        for c in ["Price", "Marcap", "Amount5D"]:
+        for c in ["Price", "MA50", "MA200", "Marcap", "Amount5D"]:
             if c in to_show.columns:
                 to_show[c] = pd.to_numeric(to_show[c], errors="coerce").round(0).astype("Int64")
 
@@ -854,6 +946,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         full_json  = OUTPUT_DIR / f"screener_full_{fixed_date}_{market}.json"
         final_json = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
+        full_csv   = OUTPUT_DIR / f"screener_full_{fixed_date}_{market}.csv"
+        final_csv  = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.csv"
 
         df_sorted.to_json(full_json, orient='records', indent=2, force_ascii=False)
         final_candidates.to_json(final_json, orient='records', indent=2, force_ascii=False)
@@ -868,8 +962,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     len(final_candidates), final_json, _fsize(final_json))
 
     logger.info("총 소요 시간: %.2fs", time.perf_counter() - t0)
-    # 실제 사용된 날짜(fixed_date)를 반환하도록 이 줄을 추가합니다.
-    return fixed_date
+    return fixed_date  # 실제 사용된 날짜 반환
 
 # ─────────────────────────────── CLI ─────────────────────────────
 def parse_args():

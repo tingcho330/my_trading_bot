@@ -133,7 +133,7 @@ def after_hour_balance(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         # 다음 페이지 호출
         if tr_cont == "M":
@@ -299,7 +299,7 @@ def bulk_trans_num(
             dataframe = current_data
 
         # 다음 페이지 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -484,7 +484,7 @@ def chk_holiday(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk
         NK100 = res.getBody().ctx_area_nk
 
@@ -596,7 +596,7 @@ def comp_interest(
             else:
                 dataframe2 = dataframe2 if dataframe2 is not None else pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -859,7 +859,7 @@ def credit_balance(
         else:
             if dataframe2 is None:
                 dataframe2 = pd.DataFrame()
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -988,7 +988,7 @@ def credit_by_company(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         # 다음 페이지 호출
         if tr_cont == "M":
@@ -1090,7 +1090,7 @@ def daily_credit_balance(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:  # 다음 페이지 존재
             logging.info("Call Next page...")
@@ -1347,7 +1347,7 @@ def disparity(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -1489,7 +1489,7 @@ def dividend_rate(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -1616,7 +1616,7 @@ def estimate_perform(
             else:
                 dataframe4 = pd.DataFrame() if dataframe4 is None else dataframe4
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -1780,7 +1780,7 @@ def exp_index_trend(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -1975,7 +1975,7 @@ def exp_total_index(
         else:
             dataframe2 = pd.DataFrame() if dataframe2 is None else dataframe2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -2126,7 +2126,7 @@ def exp_trans_updown(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2234,7 +2234,7 @@ def finance_balance_sheet(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2336,7 +2336,7 @@ def finance_financial_ratio(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2439,7 +2439,7 @@ def finance_growth_ratio(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2537,7 +2537,7 @@ def finance_income_statement(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2632,7 +2632,7 @@ def finance_other_major_ratios(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2736,7 +2736,7 @@ def finance_profit_ratio(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -2877,7 +2877,7 @@ def finance_ratio(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             print("Call Next")
@@ -2985,7 +2985,7 @@ def finance_stability_ratio(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -3096,7 +3096,7 @@ def fluctuation(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":  # 다음 페이지 존재
             print("Call Next")
@@ -3447,7 +3447,7 @@ def frgnmem_trade_trend(
         else:
             if dataframe2 is None:
                 dataframe2 = pd.DataFrame()
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -3528,7 +3528,7 @@ def hts_top_view(
             dataframe = current_data
 
         # 다음 페이지 호출 여부 결정
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -3759,7 +3759,7 @@ def inquire_balance(
             dataframe2 = current_data2
         # ⬆️⬆️⬆️ 여기까지 수정된 핵심 부분입니다 ⬆️⬆️⬆️
 
-        tr_cont = res.getHeader().get('tr_cont', '')
+        tr_cont = res.get_header().get('tr_cont', '')
         FK100 = res.getBody().get('ctx_area_fk100', '')
         NK100 = res.getBody().get('ctx_area_nk100', '')
 
@@ -3904,7 +3904,7 @@ def inquire_balance_rlz_pl(
         else:
             dataframe2 = current_data2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -4242,7 +4242,7 @@ def inquire_daily_ccld(
         else:
             dataframe2 = current_data2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -4397,7 +4397,7 @@ def inquire_daily_indexchartprice(
         else:
             dataframe2 = dataframe2 if dataframe2 is not None else pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -4813,7 +4813,7 @@ def inquire_elw_price(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -4944,7 +4944,7 @@ def inquire_index_category_price(
             else:
                 dataframe2 = dataframe2 if dataframe2 is not None else pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -5060,7 +5060,7 @@ def inquire_index_daily_price(
             else:
                 dataframe2 = pd.DataFrame() if dataframe2 is None else dataframe2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -5160,7 +5160,7 @@ def inquire_index_price(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -5253,7 +5253,7 @@ def inquire_index_tickprice(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -5351,7 +5351,7 @@ def inquire_index_timeprice(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -5902,7 +5902,7 @@ def inquire_period_profit(
         else:
             dataframe2 = current_data2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -6027,7 +6027,7 @@ def inquire_period_trade_profit(
         else:
             dataframe2 = current_data2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -6101,7 +6101,16 @@ def inquire_price(
     res = ka._url_fetch(api_url, tr_id, "", params)
 
     if res.isOK():
-        current_data = pd.DataFrame(res.getBody().output, index=[0])
+        # ▼▼▼ 오류 수정 부분 ▼▼▼
+        # API 응답 본문에서 'output' 키를 안전하게 가져옵니다.
+        output_data = res.getBody().get('output')
+        if output_data:
+            # 데이터가 딕셔너리 형태이므로 리스트로 감싸서 DataFrame을 생성합니다.
+            current_data = pd.DataFrame([output_data])
+        else:
+            # 'output' 키가 없거나 비어있는 경우, 빈 DataFrame을 생성합니다.
+            current_data = pd.DataFrame()
+        # ▲▲▲ 오류 수정 부분 ▲▲▲
         return current_data
     else:
         res.printError(url=api_url)
@@ -6339,7 +6348,7 @@ def inquire_psbl_rvsecncl(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -6435,7 +6444,7 @@ def inquire_psbl_sell(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -6664,7 +6673,7 @@ def inquire_time_indexchartprice(
         else:
             if dataframe2 is None:
                 dataframe2 = pd.DataFrame()
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -7028,7 +7037,7 @@ def inquire_vi_status(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -7672,7 +7681,7 @@ def invest_opbysec(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -7802,7 +7811,7 @@ def invest_opinion(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -7982,7 +7991,7 @@ def investor_trade_by_stock_daily(
             if dataframe2 is None:
                 dataframe2 = pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -8131,7 +8140,7 @@ def ksdinfo_bonus_issue(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8232,7 +8241,7 @@ def ksdinfo_cap_dcrs(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8345,7 +8354,7 @@ def ksdinfo_dividend(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8448,7 +8457,7 @@ def ksdinfo_forfeit(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8554,7 +8563,7 @@ def ksdinfo_list_info(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -8660,7 +8669,7 @@ def ksdinfo_mand_deposit(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         # 다음 페이지 호출
         if tr_cont == "M":
@@ -8763,7 +8772,7 @@ def ksdinfo_merger_split(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8869,7 +8878,7 @@ def ksdinfo_paidin_capin(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -8968,7 +8977,7 @@ def ksdinfo_pub_offer(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -9071,7 +9080,7 @@ def ksdinfo_purreq(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -9179,7 +9188,7 @@ def ksdinfo_rev_split(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -9278,7 +9287,7 @@ def ksdinfo_sharehld_meet(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -9420,7 +9429,7 @@ def lendable_by_company(
         else:
             if dataframe2 is None:
                 dataframe2 = pd.DataFrame()
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -9535,7 +9544,7 @@ def market_cap(
         dataframe = pd.concat([dataframe, current_data], ignore_index=True) if dataframe is not None else current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             print("Call Next")
             ka.smart_sleep()
@@ -9712,7 +9721,7 @@ def market_value(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             print("Call Next")
@@ -9899,7 +9908,7 @@ def near_new_highlow(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             print("Call Next")
@@ -10022,7 +10031,7 @@ def news_title(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         if tr_cont == "M":
             logger.info("Calling next page...")
             ka.smart_sleep()
@@ -10580,7 +10589,7 @@ def order_resv_ccnl(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK200 = res.getBody().ctx_area_fk200
         NK200 = res.getBody().ctx_area_nk200
 
@@ -11039,7 +11048,7 @@ def overtime_fluctuation(
         else:
             dataframe2 = dataframe2 if dataframe2 is not None else pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -11189,7 +11198,7 @@ def overtime_volume(
         else:
             dataframe2 = dataframe2 if dataframe2 is not None else pd.DataFrame()
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont in ["M", "F"]:
             logger.info("Calling next page...")
@@ -11373,7 +11382,7 @@ def pension_inquire_balance(
         else:
             dataframe2 = current_data2
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -11486,7 +11495,7 @@ def pension_inquire_daily_ccld(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -11818,7 +11827,7 @@ def period_rights(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
         FK100 = res.getBody().ctx_area_fk100
         NK100 = res.getBody().ctx_area_nk100
 
@@ -11949,7 +11958,7 @@ def prefer_disparate_ratio(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -12098,7 +12107,7 @@ def profit_asset_index(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             print("Call Next")
@@ -12443,7 +12452,7 @@ def quote_balance(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             print("Call Next")
@@ -12550,7 +12559,7 @@ def search_info(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -12645,7 +12654,7 @@ def search_stock_info(
             dataframe = current_data
 
         # 연속 거래 여부 확인
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -12775,7 +12784,7 @@ def short_sale(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -12917,7 +12926,7 @@ def top_interest_stock(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -13080,7 +13089,7 @@ def traded_by_company(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -13275,7 +13284,7 @@ def volume_power(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":
             logger.info("Calling next page...")
@@ -13400,7 +13409,7 @@ def volume_rank(
         else:
             dataframe = current_data
 
-        tr_cont = res.getHeader().tr_cont
+        tr_cont = res.get_tr_cont()
 
         if tr_cont == "M":  # 다음 페이지 존재
             print("Call Next")

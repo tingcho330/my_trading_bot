@@ -5,9 +5,13 @@ import os
 import requests
 import yaml
 import time
-import threading  # threading 모듈 임포트
+import threading
+import logging # 로깅 모듈 추가
 from datetime import datetime, timedelta
 from collections import namedtuple
+
+# 로거 설정
+logger = logging.getLogger(__name__)
 
 # Docker 컨테이너 내부의 설정 파일 경로를 직접 지정합니다.
 CONFIG_ROOT = "/app/config"
@@ -24,10 +28,8 @@ _last_api_call_time = 0
 def smart_sleep():
     """API 호출 간격을 조절하여 rate limit을 피하기 위한 스레드 안전 함수"""
     global _last_api_call_time
-    with _api_lock: # Lock을 사용하여 한 번에 하나의 스레드만 접근하도록 보장
+    with _api_lock:
         elapsed = time.time() - _last_api_call_time
-        # KIS API는 초당 20회 제한이므로, 50ms(0.05초) 이상 간격을 두면 안전합니다.
-        # 안정성을 위해 0.1초(100ms)로 설정합니다.
         if elapsed < 0.1:
             time.sleep(0.1 - elapsed)
         _last_api_call_time = time.time()
@@ -40,7 +42,7 @@ def _save_token(token_data):
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump(token_data, f)
     except Exception as e:
-        print(f"토큰 저장 실패: {e}")
+        logger.error(f"토큰 저장 실패: {e}")
 
 def _read_token():
     """파일에서 토큰 읽기"""
@@ -75,6 +77,7 @@ def _set_env(cfg, token):
         my_token=token,
         my_htsid=cfg["my_htsid"]
     )
+    logger.debug("환경 변수 설정 완료.")
 
 def _get_base_header():
     """기본 헤더 생성"""
@@ -93,7 +96,10 @@ class APIResp:
     def __init__(self, resp):
         self._rescode = resp.status_code
         self._resp = resp
-        self._json = resp.json()
+        try:
+            self._json = resp.json()
+        except json.JSONDecodeError:
+            self._json = {"rt_cd": "E", "msg_cd": "JSON_ERROR", "msg1": resp.text}
 
     def isOK(self):
         return self._json.get("rt_cd") == "0"
@@ -107,8 +113,11 @@ class APIResp:
     def getErrorMessage(self):
         return self._json.get("msg1")
     
-    def getHeader(self):
+    def get_header(self):
         return self._resp.headers
+
+    def get_tr_cont(self):
+        return self.get_header().get('tr_cont', '')
 
     def printError(self):
         print(f"API 오류: [{self.getErrorCode()}] {self.getErrorMessage()}")
@@ -121,10 +130,9 @@ def auth(svr="prod"):
         with open(config_file, encoding="UTF-8") as f:
             cfg = yaml.load(f, Loader=yaml.FullLoader)
     except FileNotFoundError:
-        print(f"설정 파일({config_file})을 찾을 수 없습니다. 파일을 생성하고 API 키를 입력해주세요.")
+        logger.error(f"설정 파일({config_file})을 찾을 수 없습니다.")
         return
 
-    # 1. 기존 토큰 확인
     token_data = _read_token()
     if _is_token_valid(token_data):
         print("기존 토큰이 유효하여 재사용합니다.")
@@ -133,7 +141,6 @@ def auth(svr="prod"):
         _set_env(cfg, token)
         return
 
-    # 2. 신규 토큰 발급
     print("신규 토큰을 발급합니다.")
     url_base = cfg['prod'] if svr == 'prod' else cfg['vps']
     url = f"{url_base}/oauth2/tokenP"
@@ -141,11 +148,7 @@ def auth(svr="prod"):
     app_key = cfg["my_app"] if svr == "prod" else cfg["paper_app"]
     app_secret = cfg["my_sec"] if svr == "prod" else cfg["paper_sec"]
 
-    p = {
-        "grant_type": "client_credentials",
-        "appkey": app_key,
-        "appsecret": app_secret
-    }
+    p = {"grant_type": "client_credentials", "appkey": app_key, "appsecret": app_secret}
 
     res = requests.post(url, data=json.dumps(p), headers=_BASE_HEADERS)
     if res.status_code == 200:
@@ -154,17 +157,16 @@ def auth(svr="prod"):
         _save_token(token_data)
         token = token_data['access_token']
         cfg['svr'] = svr
-        # app_key와 app_secret을 실전/모의에 맞게 설정
         cfg['my_app'] = app_key
         cfg['my_sec'] = app_secret
         _set_env(cfg, token)
         print("토큰 발급 성공!")
     else:
-        print(f"토큰 발급 실패: {res.text}")
+        logger.error(f"토큰 발급 실패: {res.text}")
 
 def _url_fetch(api_url, tr_id, tr_cont, params, postFlag=False):
     """API 호출 공통 함수"""
-    smart_sleep() # API 호출 전 지연 시간 추가
+    smart_sleep()
     if _TRENV is None:
         raise Exception("인증이 필요합니다. auth() 함수를 먼저 호출해주세요.")
 
@@ -173,15 +175,25 @@ def _url_fetch(api_url, tr_id, tr_cont, params, postFlag=False):
     headers["tr_id"] = tr_id
     headers["tr_cont"] = tr_cont
     
+    logger.debug("--- API Request ---")
+    logger.debug(f"URL: {url}")
+    logger.debug(f"Method: {'POST' if postFlag else 'GET'}")
+    logger.debug(f"Headers: {headers}")
+    logger.debug(f"Params: {params}")
+
     if postFlag:
         res = requests.post(url, headers=headers, data=json.dumps(params))
     else:
         res = requests.get(url, headers=headers, params=params)
     
+    logger.debug("--- API Response ---")
+    logger.debug(f"Status Code: {res.status_code}")
+    logger.debug(f"Response Body: {res.text}")
+    
     if res.status_code == 200:
         return APIResp(res)
     else:
-        print(f"API 요청 실패: {res.status_code}, {res.text}")
+        logger.error(f"API 요청 실패: Status Code={res.status_code}, Response={res.text}")
         return None
 
 def getTREnv():

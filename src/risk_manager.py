@@ -10,6 +10,9 @@ from typing import Tuple, Dict, Any
 
 # KIS API 모듈 임포트
 from api.kis_auth import KIS
+# 새로 추가된 모듈 임포트
+from settings import Settings
+from strategies import StrategyMixer
 
 # --- KST 시간대 정의 ---
 KST = ZoneInfo("Asia/Seoul")
@@ -44,38 +47,14 @@ def is_market_open_time() -> bool:
 
 
 class RiskManager:
-    def __init__(self, settings: dict):
+    def __init__(self, settings: Settings): # Settings 객체를 받도록 수정
         self.settings = settings
-        self.env = settings.get("trading_environment", "vps")
+        self.env = settings._config.get("trading_environment", "vps")
         self.kis = KIS(config={}, env=self.env)
-        self.risk_params = settings.get("risk_params", {})
-        self.stop_loss_pct = self.risk_params.get("stop_loss_pct", -0.05)
-        self.take_profit_pct = self.risk_params.get("take_profit_pct", 0.10)
-        self.trade_plans = self._load_trade_plans()
-
-    def _load_trade_plans(self) -> dict:
-        """gpt_trades 분석 파일을 로드하여 Ticker를 key로 하는 딕셔너리를 생성합니다."""
-        latest_plan_file = find_latest_file("gpt_trades_*.json")
-        if not latest_plan_file:
-            print("GPT 분석 파일(gpt_trades_*.json)을 찾을 수 없습니다.")
-            return {}
+        self.risk_params = settings.risk_params
         
-        print(f"GPT 분석 파일 로드: {latest_plan_file.name}")
-        with open(latest_plan_file, 'r', encoding='utf-8') as f:
-            plans = json.load(f)
-
-        plan_map = {}
-        for plan in plans:
-            stock_info = plan.get("stock_info", {})
-            ticker = stock_info.get("Ticker")
-            stop_loss = stock_info.get("손절가")
-            take_profit = stock_info.get("목표가")
-            if ticker and stop_loss is not None and take_profit is not None:
-                plan_map[ticker] = {
-                    "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit)
-                }
-        return plan_map
+        # StrategyMixer 초기화
+        self.strategy_mixer = StrategyMixer(settings)
 
     def get_realtime_price(self, ticker: str) -> float:
         """실시간 주가를 조회합니다."""
@@ -87,41 +66,40 @@ class RiskManager:
             print(f"실시간 가격 조회 오류 ({ticker}): {e}")
         return 0.0
 
-    def check_sell_condition(self, holding: Dict[str, Any]) -> Tuple[str, str]:
+    def check_sell_condition(self, holding: Dict[str, Any], stock_info: Dict[str, Any]) -> Tuple[str, str]:
         """
         보유 종목에 대한 매도 조건을 확인하고 결정과 이유를 반환합니다.
-        
-        반환: (결정, 이유) ex: ("SELL", "손절가 도달"), ("HOLD", "조건 미충족")
+        StrategyMixer를 사용하도록 수정되었습니다.
         """
         ticker = holding.get("pdno")
         prdt_name = holding.get("prdt_name", "N/A")
-        pchs_avg_pric = float(holding.get("pchs_avg_pric", 0))
+        avg_price_str = holding.get("pchs_avg_pric", "0")
+        
+        try:
+            avg_price = float(avg_price_str)
+        except (ValueError, TypeError):
+            avg_price = 0.0
 
-        if not ticker or pchs_avg_pric == 0:
+        if not ticker or avg_price <= 0:
             return "HOLD", "종목 정보 부족"
 
-        current_price = self.get_realtime_price(ticker)
-        if current_price == 0.0:
-            return "HOLD", "현재가 조회 실패"
-
-        stop_loss_price, take_profit_price, source = 0, 0, ""
-
-        if ticker in self.trade_plans:
-            stop_loss_price = self.trade_plans[ticker]['stop_loss']
-            take_profit_price = self.trade_plans[ticker]['take_profit']
-            source = "GPT 분석"
-        else:
-            stop_loss_price = pchs_avg_pric * (1 + self.stop_loss_pct)
-            take_profit_price = pchs_avg_pric * (1 + self.take_profit_pct)
-            source = "설정(%)"
-
-        profit_loss_pct = (current_price - pchs_avg_pric) / pchs_avg_pric
-        print(f"[{prdt_name}({ticker})] 현재가: {current_price:,.0f} | 수익률: {profit_loss_pct:.2%} | 목표가: {take_profit_price:,.0f} | 손절가: {stop_loss_price:,.0f} (기준: {source})")
+        # 실시간 가격 조회 (stock_info에 없을 경우)
+        if "Price" not in stock_info:
+            current_price = self.get_realtime_price(ticker)
+            if current_price == 0.0:
+                return "HOLD", "현재가 조회 실패"
+            stock_info["Price"] = current_price
         
-        if current_price <= stop_loss_price:
-            return "SELL", f"손절가({stop_loss_price:,.0f}원) 도달"
-        elif current_price >= take_profit_price:
-            return "SELL", f"이익실현가({take_profit_price:,.0f}원) 도달"
+        # StrategyMixer를 통해 매도 여부 결정
+        should_sell, reason = self.strategy_mixer.decide_sell(holding, stock_info)
+        
+        current_price = stock_info.get("Price", 0)
+        profit_loss_pct = (current_price - avg_price) / avg_price if avg_price > 0 else 0
+        
+        print(f"[{prdt_name}({ticker})] 현재가: {current_price:,.0f} | 수익률: {profit_loss_pct:.2%} | 매도판단: {should_sell} | 근거: {reason}")
+        
+        if should_sell:
+            return "SELL", reason
         
         return "HOLD", "매도 조건 미충족"
 
@@ -140,13 +118,23 @@ class RiskManager:
         if not balance_data:
             print("보유 주식이 없습니다.")
             return
-        
+            
+        # screener_full...json 파일에서 모든 종목의 상세 정보를 로드
+        full_screener_file = find_latest_file("screener_full_*.json")
+        all_stock_data = {}
+        if full_screener_file:
+            with open(full_screener_file, 'r', encoding='utf-8') as f:
+                all_stocks = json.load(f)
+            all_stock_data = {stock['Ticker']: stock for stock in all_stocks}
+
         while True:
             if is_market_open_day() and is_market_open_time():
                 print(f"\n--- {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | 보유 종목 리스크 점검 ---")
                 for holding in balance_data:
                     if int(holding.get("hldg_qty", 0)) > 0:
-                        decision, reason = self.check_sell_condition(holding)
+                        ticker = holding.get("pdno")
+                        stock_info = all_stock_data.get(ticker, {})
+                        decision, reason = self.check_sell_condition(holding, stock_info)
                         if decision == "SELL":
                             print(f"!!! 매도 신호: {holding.get('prdt_name')} - {reason} !!!")
                 
@@ -158,8 +146,12 @@ class RiskManager:
 
 if __name__ == "__main__":
     try:
-        settings = load_settings()
+        # settings 인스턴스를 직접 사용하도록 수정
+        from settings import settings
         risk_manager = RiskManager(settings)
-        risk_manager.monitor_holdings()
+        # monitor_holdings는 stock_info를 필요로 하므로, 단독 실행 시 제한이 있을 수 있습니다.
+        # 이 기능을 사용하려면 screener_full...json 파일이 필요합니다.
+        risk_manager.monitor_holdings() 
+        print("RiskManager가 성공적으로 초기화되었습니다.")
     except Exception as e:
         print(f"오류가 발생했습니다: {e}")

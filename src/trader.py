@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any, List, Tuple
 # KIS API 모듈 및 RiskManager 임포트
 from api.kis_auth import KIS
 from risk_manager import RiskManager
+# Settings 임포트 추가
+from settings import settings
 
 # ───────────────── 로깅 설정 ─────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -23,7 +25,7 @@ CONFIG_PATH = APP_DIR / "config" / "config.json"
 OUTPUT_DIR = APP_DIR / "output"
 COOLDOWN_FILE = OUTPUT_DIR / "cooldown.json"
 # Docker 볼륨 매핑에 따라 /app 바로 아래에 위치함
-ACCOUNT_SCRIPT_PATH = APP_DIR / "account.py" 
+ACCOUNT_SCRIPT_PATH = APP_DIR / "account.py"
 
 
 # ───────────────── 유틸리티 함수 ─────────────────
@@ -54,13 +56,14 @@ def get_tick_size(price: float) -> float:
     else: return 1000
 
 class Trader:
-    def __init__(self, settings: dict):
-        self.settings = settings
-        self.env = settings.get("trading_environment", "vps")
+    def __init__(self, settings_obj): # settings 객체를 받도록 수정
+        self.settings = settings_obj._config # 기존 self.settings와 호환성 유지
+        self.env = self.settings.get("trading_environment", "vps")
         self.is_real_trading = (self.env == "prod")
-        self.risk_params = settings.get("risk_params", {})
+        self.risk_params = self.settings.get("risk_params", {})
         self.cooldown_list = self._load_cooldown_list()
         self.cooldown_period_days = self.risk_params.get("cooldown_period_days", 10)
+        self.all_stock_data = self._load_all_stock_data() # 모든 종목 정보 로드
 
         try:
             self.kis = KIS(config={}, env=self.env)
@@ -71,7 +74,23 @@ class Trader:
             logger.error(f"KIS API 초기화 중 오류 발생: {e}", exc_info=True)
             raise ConnectionError("KIS API 초기화에 실패했습니다.") from e
             
-        self.risk_manager = RiskManager(settings)
+        self.risk_manager = RiskManager(settings_obj) # settings 객체 전달
+
+    def _load_all_stock_data(self) -> Dict[str, Dict]:
+        """screener_full...json 파일에서 모든 종목의 상세 정보를 로드합니다."""
+        full_screener_file = find_latest_file("screener_full_*.json")
+        if not full_screener_file:
+            logger.warning("screener_full.json 파일을 찾을 수 없어, 실시간 데이터 조회만 가능합니다.")
+            return {}
+        
+        try:
+            with open(full_screener_file, 'r', encoding='utf-8') as f:
+                all_stocks = json.load(f)
+            # Ticker를 key로 하는 딕셔너리로 변환
+            return {stock['Ticker']: stock for stock in all_stocks}
+        except (IOError, json.JSONDecodeError) as e:
+            logger.error(f"{full_screener_file.name} 파일 로드 실패: {e}")
+            return {}
 
     def _update_account_info(self):
         """
@@ -243,7 +262,11 @@ class Trader:
             if not ticker or quantity == 0:
                 continue
 
-            decision, reason = self.risk_manager.check_sell_condition(holding)
+            # 해당 종목의 상세 정보를 가져옴
+            stock_info = self.all_stock_data.get(ticker, {})
+            
+            # RiskManager에 holding 정보와 stock_info를 함께 전달
+            decision, reason = self.risk_manager.check_sell_condition(holding, stock_info)
             
             if decision == "SELL":
                 logger.info(f"매도 결정: {name}({ticker}) {quantity}주. 사유: {reason}")
@@ -372,16 +395,20 @@ class Trader:
 
 if __name__ == "__main__":
     try:
-        settings = load_settings()
+        # settings 객체를 Trader에 전달하도록 수정
         trader = Trader(settings)
 
         # 1. (매도용) 계좌 정보 업데이트 및 로드
         trader._update_account_info()
         _, initial_holdings = trader.get_account_info_from_files()
+        
+        # 유효한 보유 종목만 필터링 (hldg_qty > 0)
+        valid_holdings = [h for h in initial_holdings if trader._parse_krw(h.get("hldg_qty", 0)) > 0]
+
 
         # 2. 매도 로직 실행
-        if initial_holdings:
-            trader.run_sell_logic(initial_holdings)
+        if valid_holdings:
+            trader.run_sell_logic(valid_holdings)
         else:
             logger.info("보유 종목이 없어 매도 로직을 건너뜁니다.")
             
@@ -395,4 +422,3 @@ if __name__ == "__main__":
 
     except Exception as e:
         logger.critical(f"트레이더 실행 중 심각한 오류 발생: {e}", exc_info=True)
-

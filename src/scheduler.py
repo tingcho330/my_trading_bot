@@ -40,6 +40,11 @@ class PipelineRunFailedError(Exception):
     """파이프라인의 특정 스크립트 실행 실패 시 발생하는 예외"""
     pass
 
+def is_market_open_day() -> bool:
+    """오늘이 한국 주식 시장 개장일(월-금)인지 확인합니다."""
+    # risk_manager.py의 함수와 동일한 로직
+    return datetime.now(KST).weekday() < 5
+
 def run_script(script_name: str) -> bool:
     """주어진 파이썬 스크립트를 실행하고 성공 여부를 반환합니다."""
     
@@ -72,6 +77,11 @@ def run_script(script_name: str) -> bool:
 def run_trading_pipeline():
     """안정성 기능이 추가된 전체 자동매매 파이프라인 실행 함수"""
     
+    # --- 파이프라인 시작 전, 개장일인지 먼저 확인 ---
+    if not is_market_open_day():
+        logger.info("오늘은 주말(휴장일)이므로 자동매매 파이프라인을 실행하지 않습니다.")
+        return
+
     kst_now = datetime.now(KST)
     logger.info(f"🚀 KST {kst_now.strftime('%Y-%m-%d %H:%M:%S')} - 자동매매 파이프라인을 시작합니다.")
 
@@ -98,7 +108,6 @@ def run_trading_pipeline():
                 time.sleep(wait_time_minutes * 60)
             else:
                 logger.critical("최대 재시도 횟수를 초과하여 파이프라인을 최종 중단합니다.")
-                # (선택) 여기에 최종 실패에 대한 알림 로직(예: 이메일, 슬랙)을 추가할 수 있습니다.
                 break # 루프 종료
 
     logger.info("파이프라인 한 사이클을 종료합니다.")
@@ -107,11 +116,11 @@ def run_trading_pipeline():
 if __name__ == "__main__":
     # --- 스케줄 설정 ---
     # 매주 월요일~금요일, 한국 시간 기준 오전 8시에 파이프라인 실행
-    schedule.every().monday.at("08:00", "Asia/Seoul").do(run_trading_pipeline)
-    schedule.every().tuesday.at("08:00", "Asia/Seoul").do(run_trading_pipeline)
-    schedule.every().wednesday.at("08:00", "Asia/Seoul").do(run_trading_pipeline)
-    schedule.every().thursday.at("08:00", "Asia/Seoul").do(run_trading_pipeline)
-    schedule.every().friday.at("08:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().monday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().tuesday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().wednesday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().thursday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().friday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
 
     logger.info("스케줄러가 시작되었습니다. 다음 작업 대기 중...")
     

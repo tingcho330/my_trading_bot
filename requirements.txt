@@ -1,3 +1,5 @@
+# requirements.txt
+
 # KIS API 연동에 필요한 기본 라이브러리
 pandas==2.2.2
 requests>=2.25.0
@@ -14,3 +16,6 @@ beautifulsoup4>=4.9.0
 python-dotenv>=0.15.0
 
 openai>=1.35.3
+
+# 스케줄러 라이브러리 추가
+schedule>=1.2.0

@@ -107,7 +107,7 @@ if __name__ == "__main__":
         # 설정 파일 로드 (src/utils.load_config)
         settings = load_config()
         trading_env = settings.get("trading_environment", "mock")
-        kis_cfg = settings.get("kis_broker", {})  # 계정/키 등은 config.json의 kis_broker에 저장
+        kis_cfg = settings.get("kis_broker", {})
 
         # KIS API 인증
         kis = KIS(config=kis_cfg, env=trading_env)
@@ -118,7 +118,7 @@ if __name__ == "__main__":
 
         # 잔고/요약 조회
         df_balance, df_summary = kis.inquire_balance(
-            inqr_dvsn="02",           # 조회구분(보유/당일 등)
+            inqr_dvsn="02",
             afhr_flpr_yn="N",
             ofl_yn="",
             unpr_dvsn="01",
@@ -142,7 +142,7 @@ if __name__ == "__main__":
         recs = df_summary.to_dict("records")
         pprint.pprint(recs[0] if recs else {})
 
-        # JSON 저장 — 같은날 재실행 시 덮어쓰기
+        # JSON 저장
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         balance_file = OUTPUT_DIR / f"balance_{today}.json"
@@ -157,11 +157,19 @@ if __name__ == "__main__":
 
         # 성공 요약 디스코드 노티
         try:
-            summ = recs[0] if recs else {}
-            cash_d2 = _to_int(summ.get("prvs_rcdl_excc_amt"))
-            cash_tot = _to_int(summ.get("dnca_tot_amt"))
-            tot_eval = _to_int(summ.get("tot_evlu_amt"))
-            hold_cnt = 0 if df_balance is None or df_balance.empty else len(df_balance)
+            summary_outer = recs[0] if recs else {}
+            # [수정] '0' 키 내부의 실제 데이터 사전을 가져오도록 변경
+            summary_inner = summary_outer.get("0", {})
+
+            cash_d2 = _to_int(summary_inner.get("prvs_rcdl_excc_amt"))
+            cash_tot = _to_int(summary_inner.get("dnca_tot_amt"))
+            tot_eval = _to_int(summary_inner.get("tot_evlu_amt"))
+            
+            # hldg_qty가 0이 아닌 종목만 카운트
+            hold_cnt = 0
+            if df_balance is not None and not df_balance.empty:
+                hold_cnt = sum(1 for item in df_balance.to_dict("records") if _to_int(item.get("hldg_qty", 0)) > 0)
+
             _notify(
                 "✅ 계좌 조회 완료\n"
                 f"- 보유종목: {hold_cnt}개\n"
@@ -174,9 +182,7 @@ if __name__ == "__main__":
             _notify("✅ 계좌 조회 완료 (요약 구성 실패)")
 
     except Exception as e:
-        # 루트 로거에 붙은 DiscordLogHandler가 ERROR 이상 자동 전송함
         logger.critical("account.py 실행 중 심각한 오류 발생: %s", e, exc_info=True)
-        # 추가로 간단 알림(중복 가능성 있으나 명시적 알림 선호 시 유지)
         try:
             _notify(f"❌ account.py 실패: {str(e)[:400]}")
         except Exception:

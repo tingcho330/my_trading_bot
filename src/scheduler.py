@@ -269,11 +269,11 @@ def run_trading_pipeline():
 # ───────────────── 메인 ─────────────────
 def _register_jobs():
     # ⚠️ schedule은 tz 인자를 지원하지 않는다. 컨테이너/호스트 TZ를 KST로 설정해 사용.
-    schedule.every().monday.at("13:46").do(run_trading_pipeline)
-    schedule.every().tuesday.at("10:00").do(run_trading_pipeline)
-    schedule.every().wednesday.at("10:00").do(run_trading_pipeline)
-    schedule.every().thursday.at("10:00").do(run_trading_pipeline)
-    schedule.every().friday.at("10:00").do(run_trading_pipeline)
+    schedule.every().monday.at("10:30").do(run_trading_pipeline)
+    schedule.every().tuesday.at("10:30").do(run_trading_pipeline)
+    schedule.every().wednesday.at("10:30").do(run_trading_pipeline)
+    schedule.every().thursday.at("10:30").do(run_trading_pipeline)
+    schedule.every().friday.at("10:30").do(run_trading_pipeline)
 
 if __name__ == "__main__":
     _register_jobs()

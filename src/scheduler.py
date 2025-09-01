@@ -39,6 +39,7 @@ PIPELINE_SCRIPTS: List[str] = [
     "news_collector.py",
     "gpt_analyzer.py",
     "trader.py",
+    "reviewer.py",
 ]
 
 MARKET = os.getenv("MARKET", "KOSPI")

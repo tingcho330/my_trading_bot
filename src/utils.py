@@ -1,153 +1,164 @@
 # src/utils.py
-"""
-공통 유틸리티 모듈
-- 경로 및 KST 시간대 정의
-- 통합 로깅 설정
-- 설정 파일(config.json) 로드
-- 파일 캐시(pickle) 관리
-- 휴장일 확인
-- output 디렉토리 내 최신 파일 탐색
-"""
-
-import json
-import logging
 import os
-import pickle
+import json
 import time
-from datetime import datetime
+import logging
 from pathlib import Path
+from typing import Optional, Tuple, List, Dict
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional, Any, List
 
-# ───────────────── 경로 및 시간대 정의 ─────────────────
-
-# KST 시간대 정의
+# ────────────────────────────────
+# KST 타임존 정의
+# ────────────────────────────────
 KST = ZoneInfo("Asia/Seoul")
 
-# 공통 경로 정의
-APP_DIR = Path("/app")
-SRC_DIR = APP_DIR / "src"
-CONFIG_DIR = APP_DIR / "config"
-OUTPUT_DIR = APP_DIR / "output"
-CACHE_DIR = OUTPUT_DIR / "cache"
-CONFIG_PATH = CONFIG_DIR / "config.json"
+# ────────────────────────────────
+# 공통 경로
+# ────────────────────────────────
+OUTPUT_DIR = Path("/app/output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# ────────────────────────────────
+# 로깅 설정
+# ────────────────────────────────
+def setup_logging(level=logging.INFO):
+    """통합 로깅 시스템 설정"""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+    logger = logging.getLogger()
+    logger.info("통합 로깅 시스템이 KST 기준으로 설정되었습니다.")
+    return logger
 
-# ───────────────── 로깅 설정 ─────────────────
-
-class KSTFormatter(logging.Formatter):
-    """로그 타임스탬프를 KST로 변환하는 포매터"""
-    def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, KST)
-        if datefmt:
-            return dt.strftime(datefmt)
-        return dt.isoformat(timespec='milliseconds')
-
-_is_logging_configured = False
-
-def setup_logging():
-    """모든 모듈에서 호출할 통합 로깅 설정 함수"""
-    global _is_logging_configured
-    if _is_logging_configured:
-        return
-
-    # 기본 로거 포맷 설정
-    log_format = "%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s"
-    
-    # 루트 로거 설정
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-
-    # 핸들러 중복 추가 방지
-    if root_logger.hasHandlers():
-        root_logger.handlers.clear()
-
-    # 스트림 핸들러 (콘솔 출력)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(KSTFormatter(log_format))
-    root_logger.addHandler(stream_handler)
-    
-    _is_logging_configured = True
-    logging.info("통합 로깅 시스템이 KST 기준으로 설정되었습니다.")
-
-
-# ───────────────── 설정 및 파일 유틸리티 ─────────────────
-
-def load_config() -> dict:
-    """/app/config/config.json 설정 파일을 로드합니다."""
-    if not CONFIG_PATH.is_file():
-        raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {CONFIG_PATH}")
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logging.error(f"설정 파일({CONFIG_PATH})의 JSON 형식이 잘못되었습니다: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"설정 파일({CONFIG_PATH}) 로드 중 오류 발생: {e}")
-        raise
-
-def find_latest_file(pattern: str) -> Optional[Path]:
-    """output 디렉토리에서 특정 패턴을 가진 가장 최신 파일을 찾습니다."""
-    try:
-        # output 디렉토리가 없으면 생성
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        files = sorted(OUTPUT_DIR.glob(pattern), key=os.path.getmtime)
-        return files[-1] if files else None
-    except (FileNotFoundError, IndexError):
-        return None
-
-# ───────────────── 캐시 관리 ─────────────────
-
-def cache_path(name: str, date_str: str) -> Path:
-    """캐시 파일의 경로를 반환합니다."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR / f"{name}_{date_str}.pkl"
-
-def cache_load(name: str, date_str: str) -> Optional[Any]:
-    """파일에서 캐시를 로드합니다."""
-    p = cache_path(name, date_str)
-    if not p.is_file():
-        return None
-    try:
-        with open(p, "rb") as f:
-            return pickle.load(f)
-    except Exception as e:
-        logging.warning(f"캐시 파일 로드 실패({p.name}): {e}")
-        return None
-
-def cache_save(name: str, date_str: str, obj: Any):
-    """객체를 파일에 캐시로 저장합니다."""
-    p = cache_path(name, date_str)
-    try:
-        with open(p, "wb") as f:
-            pickle.dump(obj, f)
-    except Exception as e:
-        logging.warning(f"캐시 파일 저장 실패({p.name}): {e}")
-
-# ───────────────── 시장 개장일 확인 ─────────────────
-_kr_holidays = None
-
+# ────────────────────────────────
+# 장 개장일 체크 (단순 예시)
+# ────────────────────────────────
 def is_market_open_day() -> bool:
-    """오늘(KST)이 한국 주식 시장 개장일(월-금, 공휴일 제외)인지 확인합니다."""
-    global _kr_holidays
-    today = datetime.now(KST)
+    """한국 거래소 기준 평일 여부"""
+    today = datetime.now(KST).date()
+    # 간단히 주말만 제외
+    return today.weekday() < 5
 
-    if today.weekday() >= 5:  # 토요일(5), 일요일(6)
-        return False
+# ────────────────────────────────
+# 최신 파일 찾기
+# ────────────────────────────────
+def find_latest_file(pattern: str) -> Optional[Path]:
+    """OUTPUT_DIR 안에서 최신 파일 경로 반환"""
+    candidates = list(OUTPUT_DIR.glob(pattern))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
-    if _kr_holidays is None:
-        try:
-            import holidays
-            _kr_holidays = holidays.country_holidays("KR", years=today.year)
-        except ImportError:
-            logging.warning("'holidays' 라이브러리가 설치되지 않아 공휴일 확인을 건너뜁니다.")
-            return True # 라이브러리가 없으면 평일 여부만 판단
-        except Exception as e:
-            logging.error(f"holidays 라이브러리 오류: {e}")
-            return True # 오류 발생 시 개장일로 간주
+# ────────────────────────────────
+# JSON 파서 및 계좌/잔고 파싱
+# ────────────────────────────────
+def _read_json(p: Path) -> Optional[dict]:
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"JSON 읽기 실패: {p.name} ({e})")
+        return None
 
-    if today.date() in _kr_holidays:
-        return False
+def _parse_summary_payload(obj: dict) -> Dict[str, str]:
+    """
+    account.py 저장 포맷:
+    {"comments": {...}, "data": [ { "0": { ... } } ]}
+    또는 {"data": [ { ... } ]}
+    """
+    if not obj:
+        return {}
+    data = obj.get("data", [])
+    if not data or not isinstance(data, list):
+        return {}
+    first = data[0]
+    if isinstance(first, dict) and "0" in first and isinstance(first["0"], dict):
+        return dict(first["0"])
+    if isinstance(first, dict):
+        return dict(first)
+    return {}
 
-    return True
+def _parse_balance_payload(obj: dict) -> List[Dict]:
+    """보유 종목 리스트 파싱"""
+    if not obj:
+        return []
+    data = obj.get("data", [])
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    return []
+
+def _to_int_krw(v) -> int:
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        s = v.replace(",", "").strip()
+        return int(s) if s.isdigit() else 0
+    return 0
+
+def load_account_files_with_retry(
+    summary_pattern: str = "summary_*.json",
+    balance_pattern: str = "balance_*.json",
+    max_wait_sec: int = 5
+) -> Tuple[Dict[str, str], List[Dict], Optional[Path], Optional[Path]]:
+    """
+    최신 summary/balance 파일을 읽고 (summary_dict, balance_list, summary_path, balance_path) 반환.
+    파일이 막 생성된 직후일 수 있으므로 최대 max_wait_sec 동안 재시도.
+    """
+    logger = logging.getLogger(__name__)
+    deadline = time.time() + max_wait_sec
+    summary_path, balance_path = None, None
+    parsed_summary, parsed_balance = {}, []
+
+    while time.time() < deadline:
+        if summary_path is None:
+            summary_path = find_latest_file(summary_pattern)
+        if balance_path is None:
+            balance_path = find_latest_file(balance_pattern)
+
+        ok = True
+        if summary_path and summary_path.exists():
+            js = _read_json(summary_path)
+            parsed_summary = _parse_summary_payload(js)
+        else:
+            ok = False
+
+        if balance_path and balance_path.exists():
+            jb = _read_json(balance_path)
+            parsed_balance = _parse_balance_payload(jb)
+        else:
+            ok = False
+
+        if ok:
+            return parsed_summary, parsed_balance, summary_path, balance_path
+        time.sleep(0.5)
+
+    # 마지막 시도
+    if summary_path and summary_path.exists() and not parsed_summary:
+        js = _read_json(summary_path)
+        parsed_summary = _parse_summary_payload(js)
+    if balance_path and balance_path.exists() and not parsed_balance:
+        jb = _read_json(balance_path)
+        parsed_balance = _parse_balance_payload(jb)
+
+    return parsed_summary, parsed_balance, summary_path, balance_path
+
+def extract_cash_from_summary(summary_dict: Dict[str, str]) -> Dict[str, int]:
+    """
+    summary.json에서 현금 관련 키를 추출
+    우선순위: prvs_rcdl_excc_amt > nxdy_excc_amt > ord_psbl_cash > dnca_tot_amt > tot_evlu_amt
+    """
+    keys_priority = [
+        "prvs_rcdl_excc_amt",
+        "nxdy_excc_amt",
+        "ord_psbl_cash",
+        "dnca_tot_amt",
+        "tot_evlu_amt",
+    ]
+    out = {}
+    for k in keys_priority:
+        if k in summary_dict:
+            out[k] = _to_int_krw(summary_dict.get(k))
+    return out

@@ -17,7 +17,7 @@ def main():
     try:
         # KIS 인스턴스 생성 (설정 파일은 kis_auth.py 내부 로직에 따라 자동으로 로드됨)
         # trading_environment 설정에 따라 'prod' 또는 'vps' 모드로 자동 인증됩니다.
-        kis = KIS(env='vps') 
+        kis = KIS(env='prod') 
         if not getattr(kis, "auth_token", None):
             raise ConnectionError("KIS API 인증에 실패했습니다 (토큰 없음).")
 

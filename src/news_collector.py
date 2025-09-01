@@ -15,11 +15,18 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv, find_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ───────────────────────────── 로깅 ─────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# ───────────────── 공통 유틸 (KST 로깅/경로) ─────────────────
+from utils import (
+    setup_logging,
+    OUTPUT_DIR,
+    find_latest_file,
+)
 
-# ─────────────────────── .env 로딩 (고정 경로 + 폴백) ───────────────────────
+# ───────────────── 로깅 설정 ─────────────────
+setup_logging()
+logger = logging.getLogger("news_collector")
+
+# ───────────────── .env 로딩 (고정 경로 + 폴백) ─────────────────
 def load_env_with_fallback() -> str:
     """
     /app/config/.env 우선 → 파일 기준 후보 → CWD 후보 → find_dotenv 순으로 탐색.
@@ -65,21 +72,14 @@ DEDUPE_THRESHOLD = float(os.getenv("NEWS_TITLE_SIM_THRESHOLD", "0.85"))
 if not (NAVER_ID and NAVER_SECRET):
     logger.warning("NAVER API 키가 비었습니다. (/app/config/.env 확인) 예: NAVER_CLIENT_ID=xxx, NAVER_CLIENT_SECRET=yyy")
 
-# 경로 규칙 (screener.py와 동일)
-CWD = Path.cwd()                      # /app
-PROJECT_ROOT = CWD                    # /app
-OUTPUT_DIR = PROJECT_ROOT / "output"  # /app/output
-
-# ───────────────────────────── 유틸 ─────────────────────────────
+# ─────────────────────── 유틸 함수 ───────────────────────
 def _clean_text(text: str) -> str:
     text = re.sub(r"<.*?>", " ", text)
     text = text.replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&")
     return " ".join(text.split())
 
 def _normalize_title(text: str) -> str:
-    """
-    제목 정규화: 태그/엔티티 제거, 괄호 내용 제거, 접미 매체명 제거, 공백 정리.
-    """
+    """제목 정규화: 태그/엔티티 제거, 괄호 내용 제거, 접미 매체명 제거, 공백 정리."""
     if not text:
         return ""
     t = _clean_text(text)
@@ -92,9 +92,7 @@ def _title_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 def _dedupe_items_by_title(items: List[Dict], threshold: float = DEDUPE_THRESHOLD) -> List[Dict]:
-    """
-    제목 유사도로 중복 기사 제거(선입 우선). threshold 이상이면 중복으로 간주.
-    """
+    """제목 유사도로 중복 기사 제거(선입 우선). threshold 이상이면 중복으로 간주."""
     selected: List[Dict] = []
     norm_titles: List[str] = []
     for it in items:
@@ -109,11 +107,9 @@ def _dedupe_items_by_title(items: List[Dict], threshold: float = DEDUPE_THRESHOL
             norm_titles.append(title)
     return selected
 
-# ───────────────────────────── 외부 요청 ─────────────────────────────
+# ───────────────── NAVER API / 스크레이핑 ─────────────────
 def _fetch_naver_news_api(keyword: str, num_articles: int) -> List[Dict]:
-    """
-    NAVER 키가 없으면 빈 리스트 반환(예외 X). 호출부는 빈 결과를 적절히 처리.
-    """
+    """NAVER 키가 없으면 빈 리스트 반환(예외 X). 호출부는 빈 결과를 적절히 처리."""
     if not (NAVER_ID and NAVER_SECRET):
         return []
     url = "https://openapi.naver.com/v1/search/news.json"
@@ -159,9 +155,7 @@ def _parse_pubdate(pub: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 def _normalize_stock_dict(d: Dict) -> Dict:
-    """
-    screener 결과 키 정규화: Ticker/Name 보정
-    """
+    """screener 결과 키 정규화: Ticker/Name 보정"""
     out = dict(d)
     if not out.get("Ticker"):
         if out.get("Code"):
@@ -175,7 +169,7 @@ def _normalize_stock_dict(d: Dict) -> Dict:
                 break
     return out
 
-# ───────────────────────────── 뉴스 수집 ─────────────────────────────
+# ───────────────── 뉴스 수집 코어 ─────────────────
 def _fetch_news_for_single_stock(
     stock: Dict, cutoff_utc: datetime, num_articles: int
 ) -> Tuple[str, str]:
@@ -267,7 +261,7 @@ def run_news_collection_from_results_file(
         logger.error(f"결과 파일({results_file})이 존재하지 않습니다.")
         return
 
-    stem = results_file.stem  # e.g., "screener_results_20250829_KOSPI"
+    stem = results_file.stem  # e.g., "screener_results_YYYYMMDD_KOSPI"
     parts = stem.split("_")
     if len(parts) >= 4:
         fixed_date, market = parts[-2], parts[-1]
@@ -326,11 +320,10 @@ if __name__ == "__main__":
         )
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        candidates = sorted(OUTPUT_DIR.glob("screener_results_*.json"))
-        if not candidates:
+        latest = find_latest_file("screener_results_*.json")
+        if latest is None:
             logger.error("output/ 폴더에 screener_results_*.json 파일이 없습니다.")
         else:
-            latest = candidates[-1]
             logger.info(f"자동 선택: {latest.name}")
             run_news_collection_from_results_file(
                 latest, num_articles_per_stock=args.articles, days=args.days

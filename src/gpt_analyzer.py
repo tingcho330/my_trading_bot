@@ -1,3 +1,5 @@
+# src/gpt_analyzer.py
+
 import os
 import re
 import json
@@ -7,13 +9,20 @@ from typing import Dict, List, Any, Optional
 
 from dotenv import load_dotenv, find_dotenv
 
-# ───────────────── 로깅 ─────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ────────────── 공통 유틸 사용 ──────────────
+from utils import (
+    setup_logging,
+    OUTPUT_DIR,
+    load_config,
+    find_latest_file,
+)
+
+# ────────────── 로깅 ──────────────
+setup_logging()
 logger = logging.getLogger("gpt_analyzer")
 
-# ───────────────── .env 로딩 ─────────────────
+# ────────────── .env 로딩 ──────────────
 def _load_env() -> None:
-    # ... (기존과 동일)
     candidates = [
         Path("/app/config/.env"),
         Path(__file__).resolve().parents[1] / "config" / ".env",
@@ -22,56 +31,37 @@ def _load_env() -> None:
     ]
     loaded = ""
     for p in candidates:
-        if p.is_file():
-            load_dotenv(dotenv_path=p, override=False)
-            loaded = str(p)
-            break
+        try:
+            if p.is_file():
+                load_dotenv(dotenv_path=p, override=False)
+                loaded = str(p)
+                break
+        except Exception:
+            continue
     if not loaded:
-        found = find_dotenv(usecwd=True)
-        if found:
-            load_dotenv(found, override=False)
-            loaded = found
+        try:
+            found = find_dotenv(usecwd=True)
+            if found:
+                load_dotenv(found, override=False)
+                loaded = found
+        except Exception:
+            pass
     logger.info(f".env loaded from: {loaded if loaded else 'None'}")
-
 
 _load_env()
 
-# ───────────────── 경로 규칙 ─────────────────
-PROJECT_ROOT = Path.cwd()
-OUTPUT_DIR = PROJECT_ROOT / "output"
-
-# ───────────────── 외부 의존(리포 내부) ─────────────────
+# ────────────── 외부 의존(리포 내부) ──────────────
 try:
     from src.screener import get_market_trend
 except Exception:
     def get_market_trend(date_str: str) -> str:
         return "Sideways"
 
-# ───────────────── Config 및 OpenAI 클라이언트 로딩 ─────────────────
-_CONFIG = {}
-def _load_config() -> Dict[str, Any]:
-    global _CONFIG
-    if _CONFIG:
-        return _CONFIG
-    # ... (기존 로직과 유사하게 파일 찾기)
-    config_path = PROJECT_ROOT / "config" / "config.json"
-    if not config_path.exists():
-        config_path = Path("/app/config/config.json")
-
-    if config_path.is_file():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                _CONFIG = json.load(f)
-                return _CONFIG
-        except Exception as e:
-            logger.error(f"config 로딩 실패({config_path}): {e}")
-    return {}
-
-_config = _load_config()
+# ────────────── Config 및 OpenAI ──────────────
+_config: Dict[str, Any] = load_config() or {}
 _gpt_params = _config.get("gpt_params", {})
 OPENAI_MODEL = _gpt_params.get("openai_model", "gpt-4o-mini")
 _strategy_weights = _gpt_params.get("strategy_weights", {})
-
 
 client = None
 try:
@@ -85,9 +75,7 @@ try:
 except Exception:
     _OPENAI_AVAILABLE = False
 
-
-# ───────────────── (기존 gpt_analyzer.py 함수들 유지, 단 손절/목표가 계산은 제거) ─────────────────
-# ... (INITIAL_FILTER_PROMPT_TMPL, TACTICAL_PLAN_PROMPT_TMPL 등 프롬프트 유지) ...
+# ────────────── 프롬프트 템플릿 ──────────────
 INITIAL_FILTER_PROMPT_TMPL = (
     "You are a fast-paced hedge fund analyst. Your task is to perform a quick initial screening. "
     "Based on the provided score and news, decide if this stock is worth a deeper look for a short-term swing trade. "
@@ -148,13 +136,10 @@ TACTICAL_PLAN_PROMPT_TMPL = (
     "}}"
 )
 
+# ────────────── 헬퍼들 ──────────────
 def _read_json(p: Path) -> Any:
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
-
-def _latest_by_pattern(pattern: str) -> Optional[Path]:
-    files = sorted(OUTPUT_DIR.glob(pattern))
-    return files[-1] if files else None
 
 def _detect_files(fixed_date: str, market: str):
     screener_file = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
@@ -162,7 +147,6 @@ def _detect_files(fixed_date: str, market: str):
     return screener_file, news_file
 
 def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
-    # ... (기존과 동일)
     out = []
     for c in cands:
         item = dict(c)
@@ -174,6 +158,7 @@ def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
                 if c.get(k):
                     item["Name"] = str(c[k])
                     break
+
         def _f(key, default=0.0):
             try:
                 return float(item.get(key, default))
@@ -213,12 +198,17 @@ def _safe_json_loads(text: str) -> Optional[dict]:
         return None
 
 def _call_openai_json(system_prompt: str, user_prompt: str) -> Optional[dict]:
-    if not _OPENAI_AVAILABLE or client is None: return None
+    if not _OPENAI_AVAILABLE or client is None:
+        return None
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.1, response_format={"type": "json_object"}
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
         )
         txt = resp.choices[0].message.content or ""
         return _safe_json_loads(_strip_to_json(txt))
@@ -244,16 +234,27 @@ def _pretty_print_plans(plans: List[Dict]) -> None:
             print(f" - 손절/목표: {int(round(stop_px)):,} / {int(round(tgt_px)):,}  (source={source})")
         print(f" - 근거: {reason}...")
 
-
 def _apply_strategy_weights(selected: str, c: Dict, market_trend: str, weights: Dict[str, float]) -> str:
-    # ... (기존과 동일)
-    rsi = float(c.get("RSI", 50.0)); ma20 = bool(c.get("MA20Up", False)); hl = bool(c.get("HigherLows", False)); cons = bool(c.get("Consolidation", False)); psc = float(c.get("PatternScore", 0.0)); tech = float(c.get("TechScore", 0.5))
+    rsi = float(c.get("RSI", 50.0))
+    ma20 = bool(c.get("MA20Up", False))
+    hl = bool(c.get("HigherLows", False))
+    cons = bool(c.get("Consolidation", False))
+    psc = float(c.get("PatternScore", 0.0))
+    tech = float(c.get("TechScore", 0.5))
+
     tf = 0.5 + (0.2 if ma20 else 0.0) + (0.2 if hl else 0.0) + (0.1 if market_trend in ("Bull","Sideways") else 0.0)
     rr = 0.5 + (0.25 if rsi < 40 else 0.0) + (0.15 if not ma20 else 0.0) + (0.1 if not cons else 0.0)
     at = 0.4 + min(0.6, psc)
     da = 0.4 + min(0.5, tech)
     bs = 0.5
-    ctx = {"TrendFollowingStrategy": tf, "RsiReversalStrategy": rr, "AdvancedTechnicalStrategy": at, "DynamicAtrStrategy": da, "BaseStrategy": bs}
+
+    ctx = {
+        "TrendFollowingStrategy": tf,
+        "RsiReversalStrategy": rr,
+        "AdvancedTechnicalStrategy": at,
+        "DynamicAtrStrategy": da,
+        "BaseStrategy": bs,
+    }
     scored = {k: ctx.get(k, 0.0) * float(weights.get(k, 0.5)) for k in ctx.keys()}
     return max(scored.items(), key=lambda kv: (kv[1], 1.0 if kv[0] == selected else 0.0))[0]
 
@@ -263,12 +264,34 @@ def _initial_filter_gpt(name: str, score: float, news_text: str) -> Optional[dic
     return _call_openai_json(sys, user)
 
 def _tactical_plan_gpt(market_trend: str, c: Dict, news_text: str) -> Optional[dict]:
-    # ... (기존과 동일)
-    name = c.get("Name", "N/A"); ticker = str(c.get("Ticker", "N/A")); sector = c.get("Sector", "N/A"); price = float(c.get("Price", 0.0)); ma50 = float(c.get("MA50", 0.0)); ma200 = float(c.get("MA200", 0.0))
-    user = TACTICAL_PLAN_PROMPT_TMPL.format(market_trend=market_trend, name=name, ticker=ticker, stock_sector=sector, price=price, score=float(c.get("Score", 0.0)), fin_score=float(c.get("FinScore", 0.0)), tech_score=float(c.get("TechScore", 0.0)), mkt_score=float(c.get("MktScore", 0.0)), sector_score=float(c.get("SectorScore", 0.0)), pattern_score=float(c.get("PatternScore", 0.0)), per=("null" if c.get("PER") is None else c.get("PER")), pbr=("null" if c.get("PBR") is None else c.get("PBR")), rsi=float(c.get("RSI", 0.0)), ma50=ma50, ma200=ma200, is_ma20_rising=bool(c.get("MA20Up", False)), is_accumulation_volume=bool(c.get("AccumVol", False)), has_higher_lows=bool(c.get("HigherLows", False)), is_consolidating=bool(c.get("Consolidation", False)), has_yey_pattern=bool(c.get("YEY", False)), news_text=news_text[:1500])
+    name = c.get("Name", "N/A")
+    ticker = str(c.get("Ticker", "N/A"))
+    sector = c.get("Sector", "N/A")
+    price = float(c.get("Price", 0.0))
+    ma50 = float(c.get("MA50", 0.0))
+    ma200 = float(c.get("MA200", 0.0))
+    user = TACTICAL_PLAN_PROMPT_TMPL.format(
+        market_trend=market_trend,
+        name=name, ticker=ticker, stock_sector=sector, price=price,
+        score=float(c.get("Score", 0.0)),
+        fin_score=float(c.get("FinScore", 0.0)),
+        tech_score=float(c.get("TechScore", 0.0)),
+        mkt_score=float(c.get("MktScore", 0.0)),
+        sector_score=float(c.get("SectorScore", 0.0)),
+        pattern_score=float(c.get("PatternScore", 0.0)),
+        per=("null" if c.get("PER") is None else c.get("PER")),
+        pbr=("null" if c.get("PBR") is None else c.get("PBR")),
+        rsi=float(c.get("RSI", 0.0)),
+        ma50=ma50, ma200=ma200,
+        is_ma20_rising=bool(c.get("MA20Up", False)),
+        is_accumulation_volume=bool(c.get("AccumVol", False)),
+        has_higher_lows=bool(c.get("HigherLows", False)),
+        is_consolidating=bool(c.get("Consolidation", False)),
+        has_yey_pattern=bool(c.get("YEY", False)),
+        news_text=news_text[:1500],
+    )
     sys = "You are a Chief Investment Strategist. Output must be a single JSON object ONLY."
     return _call_openai_json(sys, user)
-
 
 def _heuristic_plan(c: Dict, news_text: str, market_trend: str) -> Dict:
     score = float(c.get("Score", 0.0))
@@ -277,7 +300,6 @@ def _heuristic_plan(c: Dict, news_text: str, market_trend: str) -> Dict:
     tactic = "분할 매수 전략" if decision == "매수" else "집중 투자 전략"
     reason = f"휴리스틱: Score={score:.3f}, 시장={market_trend}, 뉴스길이={len(news_text)}"
     return {"결정": decision, "분석": reason, "전략_클래스": base_strategy, "매매전술": tactic, "parameters": {"installments": []}}
-
 
 def analyze_candidates_and_create_plans(
     candidates: List[Dict],
@@ -319,11 +341,8 @@ def analyze_candidates_and_create_plans(
         if best != sel:
             plan_js["전략_클래스"] = best
 
-        # stock_info를 screener 결과의 모든 키를 포함하도록 수정
         stock_info = {k: v for k, v in c.items()}
-        
         merged = {"rank": len(results) + 1, "stock_info": stock_info, **plan_js}
-        
         results.append(merged)
 
     return results
@@ -334,19 +353,25 @@ def run_pipeline(
     available_slots: int = 3
 ) -> Optional[Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     if not fixed_date:
-        latest = _latest_by_pattern("screener_results_*_*.json")
+        latest = find_latest_file("screener_results_*_*.json")
         if not latest:
-            logger.error("screener_results_*.json 파일을 찾지 못했습니다."); return None
-        parts = latest.stem.split("_"); fixed_date, market = (parts[-2], parts[-1]) if len(parts) >= 4 else (None, market)
+            logger.error("screener_results_*.json 파일을 찾지 못했습니다.")
+            return None
+        parts = latest.stem.split("_")
+        fixed_date, market = (parts[-2], parts[-1]) if len(parts) >= 4 else (None, market)
         if not fixed_date:
-            logger.error(f"파일명에서 날짜/시장 추출 실패: {latest.name}"); return None
+            logger.error(f"파일명에서 날짜/시장 추출 실패: {latest.name}")
+            return None
 
     screener_file, news_file = _detect_files(fixed_date, market)
     if not screener_file.exists():
-        logger.error(f"스크리너 결과 없음: {screener_file}"); return None
+        logger.error(f"스크리너 결과 없음: {screener_file}")
+        return None
     if not news_file.exists():
-        logger.error(f"뉴스 결과 없음: {news_file} (먼저 news_collector 실행 필요)"); return None
+        logger.error(f"뉴스 결과 없음: {news_file} (먼저 news_collector 실행 필요)")
+        return None
 
     logger.info(f"로드: {screener_file.name}, {news_file.name}")
     candidates: List[Dict] = _normalize_candidates(_read_json(screener_file))
@@ -363,6 +388,7 @@ def run_pipeline(
     logger.info(f"저장 완료 → {out_path}")
     return out_path
 
+# ────────────── CLI ──────────────
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Screener + News + GPT Analyzer Pipeline")

@@ -1,3 +1,4 @@
+# src/screener.py
 import os
 import json
 import logging
@@ -7,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, List, Any, Tuple
+
 from pathlib import Path
 
 import numpy as np
@@ -14,12 +16,22 @@ import pandas as pd
 import FinanceDataReader as fdr
 from pykrx import stock as pykrx
 
-# KIS API 모듈 임포트 경로 및 방식 수정
+# ───────────────── utils 모듈 사용 ─────────────────
+from utils import (
+    setup_logging,
+    load_config,
+    OUTPUT_DIR,
+    CACHE_DIR,
+    cache_load,
+    cache_save,
+    find_latest_file,
+    is_market_open_day,
+)
 from api.kis_auth import KIS
 
-# ───────────────────────────── 기본 설정 ─────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# ───────────────── 기본 설정/로깅 ─────────────────
+setup_logging()
+logger = logging.getLogger("screener")
 pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 
 @contextmanager
@@ -31,87 +43,10 @@ def stage(name: str):
     finally:
         logger.info("⏱ %s 완료 (%.2fs)", name, time.perf_counter() - t0)
 
-# ───────────────────────────── 경로/상수 ─────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-CWD = Path.cwd()
-PROJECT_ROOT = CWD
-OUTPUT_DIR = PROJECT_ROOT / "output"
-
-# ───────────────────────────── 캐시 ─────────────────────────────
-CACHE_DIR = OUTPUT_DIR / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def _cache_path(name: str, date_str: str) -> Path:
-    return CACHE_DIR / f"{name}_{date_str}.pkl"
-
-def _cache_load(name: str, date_str: str):
-    p = _cache_path(name, date_str)
-    try:
-        if p.is_file():
-            import pickle
-            with open(p, "rb") as f:
-                return pickle.load(f)
-    except Exception:
-        pass
-    return None
-
-def _cache_save(name: str, date_str: str, obj: Any):
-    p = _cache_path(name, date_str)
-    try:
-        import pickle
-        with open(p, "wb") as f:
-            pickle.dump(obj, f)
-    except Exception:
-        pass
-
-# ─────────────────────────── 유틸리티/로딩 ───────────────────────────
+# ───────────────── 유틸 함수 (로컬) ─────────────────
 def ensure_output_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-def _first_existing_path(paths: List[Path]) -> Optional[Path]:
-    for p in paths:
-        try:
-            if p.is_file():
-                return p
-        except Exception:
-            pass
-    return None
-
-def _build_config_candidates(cli_path: Optional[str]) -> List[Path]:
-    env_path = os.getenv("CONFIG_PATH", "").strip() or None
-    candidates: List[Path] = []
-    if cli_path:
-        candidates.append(Path(cli_path).expanduser())
-    if env_path:
-        candidates.append(Path(env_path).expanduser())
-    candidates += [
-        PROJECT_ROOT / "config" / "config.json",
-        PROJECT_ROOT / "config.json",
-        Path("/app/config/config.json"),
-    ]
-    return [p.resolve() for p in candidates if p.exists()]
-
-def load_settings(config_path: Optional[str]) -> Dict[str, Any]:
-    cands = _build_config_candidates(config_path)
-    logger.info("CONFIG 탐색 후보: %s", [str(p) for p in cands])
-    found = _first_existing_path(cands)
-    if not found:
-        logger.error("설정 파일을 찾지 못했습니다.")
-        return {}
-    try:
-        with open(found, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        logger.info("설정 파일 로딩 성공: %s", str(found))
-        return cfg
-    except Exception as e:
-        logger.error("설정 파일 로딩 실패(%s): %s", str(found), e)
-        return {}
-
-def _fsize(p: Path) -> str:
-    try:
-        return f"{p.stat().st_size/1024:.1f} KB"
-    except Exception:
-        return "?"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _describe_series(name: str, s: pd.Series):
     s_num = pd.to_numeric(s, errors="coerce").dropna()
@@ -125,12 +60,30 @@ def _describe_series(name: str, s: pd.Series):
                 f"{int(qs.get(0.9, 0)):,}", f"{int(qs.get(0.95, 0)):,}",
                 f"{int(s_num.max()):,}")
 
-# ─────────────────── 손절/목표가 계산 로직 (gpt_analyzer에서 이동) ───────────────────
+# ─────────── 손절/목표가 계산 로직 ───────────
 def _yyyymmdd(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
 
 def _round_px(x: float) -> int:
     return int(round(float(x)))
+
+def get_historical_prices(ticker: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """티커의 과거 OHLCV 조회(pykrx 우선, 실패 시 FDR 백업)"""
+    try:
+        df = pykrx.get_market_ohlcv_by_date(start_date, end_date, ticker)
+        if df is not None and not df.empty:
+            return df.rename(columns={
+                '시가':'Open','고가':'High','저가':'Low','종가':'Close','거래량':'Volume'
+            })
+    except Exception as e:
+        logger.debug("%s: pykrx 시세 조회 실패(%s). fdr로 전환.", ticker, e)
+    try:
+        df = fdr.DataReader(ticker, start=start_date, end=end_date)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        logger.debug("%s: fdr 시세 조회도 실패(%s).", ticker, e)
+    return None
 
 def _safe_fetch_prices(ticker: str, start: str, end: str, retries: int = 3):
     for _ in range(retries):
@@ -138,17 +91,22 @@ def _safe_fetch_prices(ticker: str, start: str, end: str, retries: int = 3):
         if df is not None and not df.empty:
             return df
         time.sleep(0.5)
-    if fdr is not None:
-        for _ in range(retries):
-            try:
-                df = fdr.DataReader(ticker, start=start, end=end)
-                if df is not None and not df.empty:
-                    return df
-            except Exception:
-                time.sleep(0.5)
+    try:
+        df = fdr.DataReader(ticker, start=start, end=end)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
     return None
 
 def _compute_levels(ticker: str, entry_price: float, date_str: str, risk_params: dict) -> Dict:
+    """ATR·스윙 저점 기반 손절/목표가 산출, 실패 시 퍼센트 백업."""
+    def _percent_backup() -> Dict:
+        stop_px = entry_price * (1.0 - stop_pct)
+        risk = max(1e-6, entry_price - stop_px)
+        tgt_px = entry_price + rr * risk
+        return {"손절가": _round_px(stop_px), "목표가": _round_px(tgt_px), "source": "percent_backup"}
+
     try:
         atr_period = int(risk_params.get("atr_period", 14))
         atr_k_stop = float(risk_params.get("atr_k_stop", 1.5))
@@ -156,16 +114,9 @@ def _compute_levels(ticker: str, entry_price: float, date_str: str, risk_params:
         rr = float(risk_params.get("reward_risk", 2.0))
         stop_pct = float(risk_params.get("stop_pct", 0.03))
 
-        def _percent_backup() -> Dict:
-            stop_px = entry_price * (1.0 - stop_pct)
-            risk = max(1e-6, entry_price - stop_px)
-            tgt_px = entry_price + rr * risk
-            return {"손절가": _round_px(stop_px), "목표가": _round_px(tgt_px), "source": "percent_backup"}
-
         end_dt = datetime.strptime(date_str, "%Y%m%d")
         start_dt = end_dt - timedelta(days=max(atr_period * 6, 180))
         df = _safe_fetch_prices(ticker, _yyyymmdd(start_dt), _yyyymmdd(end_dt))
-
         if df is None or len(df) < max(atr_period + 5, swing_lookback + 5):
             return _percent_backup()
 
@@ -180,18 +131,15 @@ def _compute_levels(ticker: str, entry_price: float, date_str: str, risk_params:
         tr["L-PC"] = (low - prev_close).abs()
         TR = tr.max(axis=1)
         ATR = TR.rolling(window=atr_period, min_periods=atr_period).mean()
-
         if ATR.dropna().empty:
             return _percent_backup()
-
         atr = float(ATR.dropna().iloc[-1])
+
         swing_low = float(low.tail(swing_lookback).min())
         stop_atr = entry_price - atr_k_stop * atr
         stop_px = max(stop_atr, swing_low)
-
         if stop_px >= entry_price:
             stop_px = entry_price * (1.0 - stop_pct)
-
         risk = max(1e-6, entry_price - stop_px)
         tgt_px = entry_price + rr * risk
 
@@ -199,7 +147,7 @@ def _compute_levels(ticker: str, entry_price: float, date_str: str, risk_params:
     except Exception:
         return _percent_backup()
 
-# ─────────────────────────── (기존 screener.py 함수들) ───────────────────────────
+# ─────────── 데이터/지표 함수 ───────────
 def get_stock_listing(market: str = "KOSPI") -> pd.DataFrame:
     logger.info("종목 목록 조회(FDR): market=%s", market)
     df = fdr.StockListing(market)
@@ -222,7 +170,6 @@ def _norm_code_index(obj: pd.DataFrame) -> pd.DataFrame:
     return obj
 
 def get_fundamentals(date_str: str, market: str = "KOSPI") -> pd.DataFrame:
-    """pykrx로 특정 기준일의 펀더멘털(PER, PBR 등)을 티커별 조회"""
     logger.info("펀더멘털 조회(PYKRX): date=%s market=%s", date_str, market)
     try:
         df = pykrx.get_market_fundamental_by_ticker(date_str, market=market)
@@ -230,24 +177,6 @@ def get_fundamentals(date_str: str, market: str = "KOSPI") -> pd.DataFrame:
     except Exception as e:
         logger.error("펀더멘털 조회 실패 (%s, %s): %s", date_str, market, e)
         return pd.DataFrame()
-
-def get_historical_prices(ticker: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-    """티커의 과거 OHLCV 조회(pykrx 우선, 실패 시 FDR 백업)"""
-    try:
-        df = pykrx.get_market_ohlcv_by_date(start_date, end_date, ticker)
-        if df is not None and not df.empty:
-            return df.rename(columns={
-                '시가':'Open','고가':'High','저가':'Low','종가':'Close','거래량':'Volume'
-            })
-    except Exception as e:
-        logger.debug("%s: pykrx 시세 조회 실패(%s). fdr로 전환.", ticker, e)
-    try:
-        df = fdr.DataReader(ticker, start=start_date, end=end_date)
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        logger.debug("%s: fdr 시세 조회도 실패(%s).", ticker, e)
-    return None
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
@@ -359,17 +288,16 @@ def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
                 return code_map[code]
     return None
 
-# ─────────────────── KIS API 호출 로직 수정 ───────────────────
+# ─────────── KIS 호출 & 섹터 보강 ───────────
 def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
     if cache_key:
-        cached = _cache_load('kis_sector_map', cache_key)
+        cached = cache_load('kis_sector_map', cache_key)
         if isinstance(cached, dict) and cached:
-            logger.info("kis 섹터맵 캐시 사용: %s", _cache_path('kis_sector_map', cache_key).name)
+            logger.info("kis 섹터맵 캐시 사용: kis_sector_map_%s.pkl", cache_key)
             return cached
 
     def _fetch_one(code: str) -> Tuple[str, str]:
         try:
-            # KIS 인스턴스를 통해 API 호출 (수정됨)
             df = kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
             if df is not None and not df.empty:
                 sec = _extract_sector_from_kis_df(df)
@@ -389,7 +317,7 @@ def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = N
             if i % 20 == 0 or i == total:
                 logger.info("  >> KIS(inquire_price) 섹터 조회 진행: %d/%d (%.1f%%)", i, total, i * 100.0 / total)
     if cache_key:
-        _cache_save('kis_sector_map', cache_key, sectors)
+        cache_save('kis_sector_map', cache_key, sectors)
     return sectors
 
 def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
@@ -402,7 +330,6 @@ def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, c
     if len(target_idx) == 0: logger.info("KIS 보강 대상 없음."); return out
     logger.info("KIS(inquire_price) 섹터 보강 시작 (대상 %d종목)", len(target_idx))
     ck = cache_key or datetime.now().strftime("%Y%m%d")
-    # kis 인스턴스를 전달하도록 수정
     kis_map = _get_kis_sector_map([str(x).zfill(6) for x in target_idx.tolist()], kis, ck, workers)
     out.loc[target_idx, "Sector"] = out.loc[target_idx].index.to_series().map(kis_map).values
     out["Sector"] = out["Sector"].map(_normalize_sector_name).fillna("N/A").astype("object")
@@ -461,11 +388,10 @@ def _log_sector_summary(df: pd.DataFrame, label: str):
     logger.info("섹터 요약(%s): 고유=%d, N/A=%d (%.1f%%), TOP5=%s",
                 label, len(vc), na, ratio, vc.head(5).to_dict())
 
-
 def _get_pykrx_ticker_sector_map(date_str: str) -> Dict[str, str]:
-    cached = _cache_load("pykrx_sector_map", date_str)
+    cached = cache_load("pykrx_sector_map", date_str)
     if cached is not None:
-        logger.info("pykrx 섹터맵 캐시 사용: %s", _cache_path("pykrx_sector_map", date_str).name)
+        logger.info("pykrx 섹터맵 캐시 사용: pykrx_sector_map_%s.pkl", date_str)
         return cached
     logger.info("pykrx를 이용한 티커-섹터 정보 매핑 시작...")
     ticker_sector_map: Dict[str, str] = {}
@@ -480,13 +406,13 @@ def _get_pykrx_ticker_sector_map(date_str: str) -> Dict[str, str]:
         logger.info("✅ %d개 종목의 섹터 정보 매핑 완료.", len(ticker_sector_map))
     except Exception as e:
         logger.error("티커-섹터 정보 매핑 중 오류 발생: %s", e)
-    _cache_save("pykrx_sector_map", date_str, ticker_sector_map)
+    cache_save("pykrx_sector_map", date_str, ticker_sector_map)
     return ticker_sector_map
 
 def _calculate_sector_trends(date_str: str) -> Dict[str, float]:
-    cached = _cache_load("sector_trends", date_str)
+    cached = cache_load("sector_trends", date_str)
     if cached is not None:
-        logger.info("섹터 트렌드 캐시 사용: %s", _cache_path("sector_trends", date_str).name)
+        logger.info("섹터 트렌드 캐시 사용: sector_trends_%s.pkl", date_str)
         return cached
     logger.info("KOSPI 업종별 트렌드 분석 시작...")
     sector_trends: Dict[str, float] = {}
@@ -507,7 +433,7 @@ def _calculate_sector_trends(date_str: str) -> Dict[str, float]:
         logger.info("✅ %d개 업종 트렌드 분석 완료.", len(sector_trends))
     except Exception as e:
         logger.error("업종 트렌드 분석 중 오류 발생: %s. 빈 데이터를 반환합니다.", e)
-    _cache_save("sector_trends", date_str, sector_trends)
+    cache_save("sector_trends", date_str, sector_trends)
     return sector_trends
 
 def _apply_sector_source_order(df_base: pd.DataFrame, order: List[str], kis: KIS, workers: int, date_str: str, market: str) -> pd.DataFrame:
@@ -693,25 +619,45 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
                 if len(selected_idx) >= top_n: break
     return df_sorted.loc[selected_idx]
 
+# ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
     logger.info("▶ KIS API 사용 스크리닝 시작 (기준일: %s, 시장: %s)", date_str, market)
     if debug:
         logger.setLevel(logging.DEBUG)
 
     ensure_output_dir()
-    settings = load_settings(config_path)
+
+    # config는 utils.load_config() 우선 사용. CLI 지정이 있으면 해당 경로를 병합/오버레이.
+    settings = load_config()
+    if config_path and Path(config_path).expanduser().is_file():
+        try:
+            with open(Path(config_path).expanduser(), "r", encoding="utf-8") as f:
+                cli_cfg = json.load(f)
+            # 얕은 병합(동일 키는 CLI가 우선)
+            settings.update(cli_cfg or {})
+            logger.info("CLI config 병합 완료: %s", str(Path(config_path).expanduser()))
+        except Exception as e:
+            logger.warning("CLI config 병합 실패(%s): %s", config_path, e)
+
     if not settings:
         logger.error("설정 로딩 실패로 종료합니다.")
         return
 
-    # KIS 클래스 인스턴스화 (수정됨)
+    # KIS 인스턴스
     broker_config = settings.get("kis_broker", {})
     trading_env = settings.get("trading_environment", "mock")
     kis = KIS(broker_config, env=trading_env)
-    if not kis.auth_token:
+    if not getattr(kis, "auth_token", None):
         logger.error("KIS API 인증 실패로 종료합니다.")
         return
-    logger.info(f"'{trading_env}' 모드로 KIS API 인증 완료.")
+    logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
+
+    # 장 열림 여부(필요 시 활용)
+    try:
+        open_day = is_market_open_day()
+        logger.info("오늘 한국 시장 개장일 여부: %s", "개장" if open_day else "휴장")
+    except Exception as e:
+        logger.warning("시장 개장일 확인 실패: %s", e)
 
     screener_params = settings.get("screener_params", {})
     risk_params     = settings.get("risk_params", {})
@@ -721,9 +667,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         if df_filtered.empty:
             logger.warning("❌ 1차 필터링 결과, 대상 종목이 없습니다.")
             return
+
     with stage("섹터 보강"):
         order = screener_params.get("sector_source_priority", ["pykrx", "kis", "fdr"])
-        # kis 인스턴스 전달
         df_filtered = _apply_sector_source_order(df_filtered, order, kis, workers, fixed_date, market)
 
     with stage("시장 레짐 계산"):
@@ -738,7 +684,6 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     with stage("섹터 트렌드 계산"):
         sector_trends = _calculate_sector_trends(fixed_date)
-
 
     with stage("상세 분석(스코어링)"):
         results = []
@@ -778,7 +723,6 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         for _, row in final_candidates.iterrows():
             levels = _compute_levels(row["Ticker"], row["Price"], fixed_date, risk_params)
             levels_data.append(levels)
-        
         df_levels = pd.DataFrame(levels_data, index=final_candidates.index)
         final_candidates = pd.concat([final_candidates, df_levels], axis=1)
 
@@ -800,12 +744,12 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         logger.info("전체 랭킹 저장: %s", full_json)
         logger.info("✅ 스크리닝 완료. %d개 후보 저장: %s", len(final_candidates), final_json)
 
-
+# ─────────── CLI ───────────
 def parse_args():
     parser = argparse.ArgumentParser(description="KOSPI/KOSDAQ/KONEX 스크리너")
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--market", default=os.getenv("MARKET", "KOSPI"), choices=["KOSPI", "KOSDAQ", "KONEX"])
-    parser.add_argument("--config", help="config.json 파일 경로")
+    parser.add_argument("--config", help="추가/오버레이할 config.json 파일 경로")
     parser.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "4")))
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()

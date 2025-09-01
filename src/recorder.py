@@ -1,17 +1,66 @@
 # src/recorder.py
-
 import os
 import sqlite3
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Set, Optional
 from contextlib import contextmanager
 
-# --- DB 경로 및 초기화 ------------------------------------------------
-DB_PATH = "/app/output/trading_log.db"
+# ── 공통 유틸 ──
+from utils import setup_logging, OUTPUT_DIR, KST
+
+# ── 디스코드 노티파이어 ──
+from notifier import (
+    DiscordLogHandler,
+    WEBHOOK_URL,
+    is_valid_webhook,
+    send_discord_message,
+    create_trade_embed,  # 있으면 사용, 없으면 텍스트만 전송
+)
+
+# ───────────────── 로깅/경로 초기화 ─────────────────
+setup_logging()
+logger = logging.getLogger("recorder")
+
+# 루트 로거에 디스코드 에러 핸들러 장착(중복 방지)
+_root = logging.getLogger()
+if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+    if not any(isinstance(h, DiscordLogHandler) for h in _root.handlers):
+        _root.addHandler(DiscordLogHandler(WEBHOOK_URL))
+        logger.info("DiscordLogHandler attached to root logger.")
+else:
+    logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
+
+# ───────────────── 알림 쿨다운 ─────────────────
+_last_sent: Dict[str, float] = {}
+def _notify(msg: str, key: str, cooldown_sec: int = 120):
+    if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
+        return
+    now = time.time()
+    if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
+        _last_sent[key] = now
+        try:
+            send_discord_message(content=msg)
+        except Exception:
+            # 알림 실패는 기능에 영향 없도록 무시
+            pass
+
+def _notify_embed_safe(embed: Dict, key: str, cooldown_sec: int = 120):
+    if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
+        return
+    now = time.time()
+    if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
+        _last_sent[key] = now
+        try:
+            send_discord_message(embeds=[embed])
+        except Exception:
+            pass
+
+# ───────────────── DB 경로 ─────────────────
+DB_PATH = str((OUTPUT_DIR / "trading_log.db").resolve())
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------
 @contextmanager
@@ -31,6 +80,8 @@ def get_db_connection(db_path: Optional[str] = None):
         logger.error(f"DB 트랜잭션 실패: {e}", exc_info=True)
         if conn:
             conn.rollback()
+        # 심각 오류 알림(쿨다운)
+        _notify(f"🧨 DB 트랜잭션 실패: {str(e)[:900]}", key="recorder_db_tx_fail", cooldown_sec=300)
         raise
     finally:
         if conn:
@@ -70,7 +121,7 @@ def _migrate_db_schema(conn: sqlite3.Connection):
             gpt_summary     TEXT,
             gpt_analysis    TEXT
         )
-    """
+        """
     )
 
     # 2) 컬럼 누락 시 추가
@@ -102,6 +153,7 @@ def initialize_db(db_path: Optional[str] = None):
         logger.info("✅ DB 스키마 확인 & 마이그레이션 완료")
     except Exception as e:
         logger.critical(f"DB 초기화 실패: {e}", exc_info=True)
+        _notify(f"🧨 DB 초기화 실패: {str(e)[:900]}", key="recorder_db_init_fail", cooldown_sec=600)
         raise
 
 # --------------------------------------------------------------------
@@ -127,8 +179,9 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
+    ts = datetime.now(KST).isoformat()
     params = (
-        datetime.now().isoformat(),
+        ts,
         trade_data.get("side"),
         trade_data.get("ticker"),
         trade_data.get("name"),
@@ -149,12 +202,35 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
         with get_db_connection(db_path) as conn:
             conn.execute(sql, params)
             conn.commit()
-        logger.info(
-            f"✅ 거래 기록: {trade_data.get('side').upper()} {trade_data.get('name')} {trade_data.get('qty')}주"
-        )
+        # 로그 & (선택) 간단 알림
+        s = trade_data.get("side", "").upper()
+        name = trade_data.get("name")
+        qty = trade_data.get("qty")
+        logger.info(f"✅ 거래 기록: {s} {name} {qty}주 (ts={ts})")
+
+        # 임베드 알림(있으면)
+        try:
+            embed = create_trade_embed({
+                "side": s,
+                "name": name,
+                "ticker": trade_data.get("ticker"),
+                "qty": trade_data.get("qty"),
+                "price": trade_data.get("price"),
+                "trade_status": trade_data.get("trade_status"),
+                "strategy_details": trade_data.get("strategy_details"),
+            })
+            _notify_embed_safe(embed, key=f"recorder_insert_{s}_{trade_data.get('ticker','')}", cooldown_sec=60)
+        except Exception:
+            # create_trade_embed 미존재 또는 실패 → 텍스트로 최소 알림(쿨다운)
+            _notify(
+                f"📝 거래 기록: {s} {name} x{qty} @ {trade_data.get('price')}",
+                key=f"recorder_insert_text_{trade_data.get('ticker','')}",
+                cooldown_sec=60
+            )
+
     except Exception as e:
         logger.error(f"DB 거래 기록 실패: {e}", exc_info=True)
-
+        _notify(f"🧨 DB 거래 기록 실패: {str(e)[:900]}", key="recorder_record_fail", cooldown_sec=300)
 
 def fetch_active_trades(db_path: Optional[str] = None) -> List[Dict]:
     """trade_status='active' 인 거래 반환"""
@@ -167,12 +243,16 @@ def fetch_active_trades(db_path: Optional[str] = None) -> List[Dict]:
             for row in rows:
                 trade = dict(row)
                 if trade.get("strategy_details"):
-                    trade["strategy_details"] = json.loads(trade["strategy_details"])
+                    try:
+                        trade["strategy_details"] = json.loads(trade["strategy_details"])
+                    except Exception:
+                        # 파싱 실패 시 원문 유지
+                        pass
                 active_trades.append(trade)
     except Exception as e:
         logger.error(f"Active 거래 조회 실패: {e}")
+        _notify(f"🧨 Active 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_active_fail", cooldown_sec=300)
     return active_trades
-
 
 def update_trade_status(
     trade_id: int,
@@ -188,9 +268,15 @@ def update_trade_status(
             conn.execute(sql, (new_status, details_json, trade_id))
             conn.commit()
         logger.info(f"거래 ID {trade_id} → 상태 '{new_status}' 업데이트")
+
+        # 간단 알림(상태 변경 중요 이벤트)
+        _notify(f"🔄 거래 상태 변경: id={trade_id}, status={new_status}",
+                key=f"recorder_status_{trade_id}_{new_status}", cooldown_sec=120)
+
     except Exception as e:
         logger.error(f"거래 상태 업데이트 실패 (ID={trade_id}): {e}")
-
+        _notify(f"🧨 거래 상태 업데이트 실패 (ID={trade_id}): {str(e)[:900]}",
+                key="recorder_update_status_fail", cooldown_sec=300)
 
 def fetch_trades_by_tickers(
     tickers: List[str], db_path: Optional[str] = None
@@ -216,9 +302,11 @@ def fetch_trades_by_tickers(
                 trades_map[row["ticker"]] = dict(row)
     except Exception as e:
         logger.error(f"티커별 거래 조회 실패: {e}")
+        _notify(f"🧨 티커별 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_tickers_fail", cooldown_sec=300)
 
     return trades_map
 
+# ───────────────── 단독 실행 테스트 ─────────────────
 if __name__ == '__main__':
     # 데이터베이스 초기화 (테이블 생성 및 마이그레이션)
     initialize_db()
@@ -247,13 +335,13 @@ if __name__ == '__main__':
         "name": "SK하이닉스",
         "qty": 5,
         "price": 150000,
-        "pnl_amount": 50000, # 5만원 수익
-        "parent_trade_id": 1, # 매수 거래 ID
+        "pnl_amount": 50000,  # 5만원 수익
+        "parent_trade_id": 1,  # 매수 거래 ID
         "strategy_name": "RsiReversalStrategy",
         "trade_status": "completed",
         "strategy_details": {"RSI": 75, "reason": "RSI 과매수 구간 진입"},
     }
-    
+
     # 1. 매수 기록 테스트
     record_trade(sample_buy_trade)
 
@@ -269,7 +357,7 @@ if __name__ == '__main__':
     print("\n--- Fetch by Tickers ---")
     trades = fetch_trades_by_tickers(["005930"])
     print(json.dumps(trades, indent=2, ensure_ascii=False))
-    
+
     # 5. 거래 상태 업데이트 테스트
     if active:
         update_trade_status(active[0]['id'], "completed")

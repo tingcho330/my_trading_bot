@@ -22,16 +22,16 @@
         "bfdy_tlex_amt": "51",
         "thdt_tlex_amt": "0",
         "tot_loan_amt": "0",
-        "scts_evlu_amt": "393320",
-        "tot_evlu_amt": "480619",
-        "nass_amt": "480619",
+        "scts_evlu_amt": "393370",
+        "tot_evlu_amt": "480669",
+        "nass_amt": "480669",
         "fncg_gld_auto_rdpt_yn": "",
         "pchs_amt_smtl_amt": "391569",
-        "evlu_amt_smtl_amt": "393320",
-        "evlu_pfls_smtl_amt": "1750",
+        "evlu_amt_smtl_amt": "393370",
+        "evlu_pfls_smtl_amt": "1800",
         "tot_stln_slng_chgs": "0",
         "bfdy_tot_asst_evlu_amt": "477919",
-        "asst_icdc_amt": "2700",
+        "asst_icdc_amt": "2750",
         "asst_icdc_erng_rt": "0.00000000"
       }
     }

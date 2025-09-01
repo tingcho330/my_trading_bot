@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, List, Any, Tuple
-
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,7 @@ import pandas as pd
 import FinanceDataReader as fdr
 from pykrx import stock as pykrx
 
-# ───────────────── utils 모듈 사용 ─────────────────
+# ───────────────── utils ─────────────────
 from utils import (
     setup_logging,
     load_config,
@@ -29,19 +28,49 @@ from utils import (
 )
 from api.kis_auth import KIS
 
+# ───────────────── notifier ─────────────────
+from notifier import (
+    DiscordLogHandler,
+    WEBHOOK_URL,
+    is_valid_webhook,
+    send_discord_message,
+)
+
 # ───────────────── 기본 설정/로깅 ─────────────────
 setup_logging()
 logger = logging.getLogger("screener")
 pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 
+# 루트 로거에 디스코드 에러 핸들러 부착(중복 방지)
+_root = logging.getLogger()
+if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+    if not any(isinstance(h, DiscordLogHandler) for h in _root.handlers):
+        _root.addHandler(DiscordLogHandler(WEBHOOK_URL))
+        logger.info("DiscordLogHandler attached to root logger.")
+else:
+    logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
+
+# ── 간단 쿨다운(스팸 방지) ──
+_last_sent = {}
+def _notify(content: str, key: str, cooldown_sec: int = 120):
+    now = time.time()
+    if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
+        _last_sent[key] = now
+        send_discord_message(content=content)
+
 @contextmanager
-def stage(name: str):
+def stage(name: str, notify_key: Optional[str] = None):
     t0 = time.perf_counter()
     logger.info("▶ %s 시작", name)
+    if notify_key:
+        _notify(f"▶ {name} 시작", key=f"{notify_key}_start", cooldown_sec=60)
     try:
         yield
     finally:
-        logger.info("⏱ %s 완료 (%.2fs)", name, time.perf_counter() - t0)
+        secs = time.perf_counter() - t0
+        logger.info("⏱ %s 완료 (%.2fs)", name, secs)
+        if notify_key:
+            _notify(f"⏱ {name} 완료 ({secs:.1f}s)", key=f"{notify_key}_done", cooldown_sec=60)
 
 # ───────────────── 유틸 함수 (로컬) ─────────────────
 def ensure_output_dir():
@@ -621,26 +650,30 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
 
 # ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
-    logger.info("▶ KIS API 사용 스크리닝 시작 (기준일: %s, 시장: %s)", date_str, market)
+    start_msg = f"📊 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
+    logger.info(start_msg)
+    _notify(start_msg, key="screener_start", cooldown_sec=60)
+
     if debug:
         logger.setLevel(logging.DEBUG)
 
     ensure_output_dir()
 
-    # config는 utils.load_config() 우선 사용. CLI 지정이 있으면 해당 경로를 병합/오버레이.
+    # config 로드/병합
     settings = load_config()
     if config_path and Path(config_path).expanduser().is_file():
         try:
             with open(Path(config_path).expanduser(), "r", encoding="utf-8") as f:
                 cli_cfg = json.load(f)
-            # 얕은 병합(동일 키는 CLI가 우선)
             settings.update(cli_cfg or {})
             logger.info("CLI config 병합 완료: %s", str(Path(config_path).expanduser()))
         except Exception as e:
             logger.warning("CLI config 병합 실패(%s): %s", config_path, e)
 
     if not settings:
-        logger.error("설정 로딩 실패로 종료합니다.")
+        msg = "설정 로딩 실패로 종료합니다."
+        logger.error(msg)
+        _notify(f"❌ {msg}", key="screener_config_err", cooldown_sec=60)
         return
 
     # KIS 인스턴스
@@ -648,11 +681,13 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     trading_env = settings.get("trading_environment", "mock")
     kis = KIS(broker_config, env=trading_env)
     if not getattr(kis, "auth_token", None):
-        logger.error("KIS API 인증 실패로 종료합니다.")
+        msg = "KIS API 인증 실패로 종료합니다."
+        logger.error(msg)
+        _notify(f"❌ {msg}", key="screener_kis_auth_fail", cooldown_sec=60)
         return
     logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
 
-    # 장 열림 여부(필요 시 활용)
+    # 개장일 안내(옵션)
     try:
         open_day = is_market_open_day()
         logger.info("오늘 한국 시장 개장일 여부: %s", "개장" if open_day else "휴장")
@@ -662,17 +697,19 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     screener_params = settings.get("screener_params", {})
     risk_params     = settings.get("risk_params", {})
 
-    with stage("1차 필터링"):
+    with stage("1차 필터링", notify_key="screener_stage1"):
         df_filtered, fixed_date = _filter_initial_stocks(date_str, screener_params, market, risk_params, debug)
         if df_filtered.empty:
-            logger.warning("❌ 1차 필터링 결과, 대상 종목이 없습니다.")
+            msg = "❌ 1차 필터링 결과, 대상 종목이 없습니다."
+            logger.warning(msg)
+            _notify(msg, key="screener_no_candidates_stage1", cooldown_sec=60)
             return
 
-    with stage("섹터 보강"):
+    with stage("섹터 보강", notify_key="screener_sector"):
         order = screener_params.get("sector_source_priority", ["pykrx", "kis", "fdr"])
         df_filtered = _apply_sector_source_order(df_filtered, order, kis, workers, fixed_date, market)
 
-    with stage("시장 레짐 계산"):
+    with stage("시장 레짐 계산", notify_key="screener_regime"):
         regime = _get_market_regime_score(fixed_date, market)
         market_score = 0.7 * regime + 0.3 * 0.5
         comps = _get_market_regime_components(fixed_date, market)
@@ -682,10 +719,10 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     comps["above_ma50"], comps["ma50_gt_ma200"], comps["rsi_term"])
         logger.info("시장 단기 추세(60D MA5/MA20): %s", market_trend)
 
-    with stage("섹터 트렌드 계산"):
+    with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
-    with stage("상세 분석(스코어링)"):
+    with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         results = []
         total = len(df_filtered)
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -703,10 +740,12 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 if res:
                     results.append(res)
         if not results:
-            logger.warning("❌ 2차 스크리닝 결과, 최종 후보가 없습니다.")
+            msg = "❌ 2차 스크리닝 결과, 최종 후보가 없습니다."
+            logger.warning(msg)
+            _notify(msg, key="screener_no_candidates_stage2", cooldown_sec=60)
             return
 
-    with stage("결과 정렬/다양화/손절목표가 계산/저장"):
+    with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize"):
         df_scores = pd.DataFrame(results).set_index("Ticker")
         df_scores = df_scores.drop(columns=["Sector"], errors="ignore")
 
@@ -743,6 +782,16 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         final_candidates.to_json(final_json, orient='records', indent=2, force_ascii=False)
         logger.info("전체 랭킹 저장: %s", full_json)
         logger.info("✅ 스크리닝 완료. %d개 후보 저장: %s", len(final_candidates), final_json)
+
+        # 디스코드 요약 알림(상위 5개)
+        try:
+            top5 = final_candidates.head(5)[["Ticker","Name","Sector","Price","목표가","손절가","Score"]]
+            lines = ["Top5:"]
+            for _, r in top5.iterrows():
+                lines.append(f"- {r['Name']}({str(r['Ticker']).zfill(6)}), Sec:{r['Sector']}, Px:{int(r['Price']):,}, TP:{int(r['목표가']):,}, SL:{int(r['손절가']):,}, S:{r['Score']:.3f}")
+            _notify("✅ 스크리너 완료\n" + "\n".join(lines), key="screener_done", cooldown_sec=60)
+        except Exception:
+            _notify("✅ 스크리너 완료 (요약 구성 실패)", key="screener_done", cooldown_sec=60)
 
 # ─────────── CLI ───────────
 def parse_args():

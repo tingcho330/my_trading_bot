@@ -1,15 +1,15 @@
 # src/gpt_analyzer.py
-
 import os
 import re
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from dotenv import load_dotenv, find_dotenv
 
-# ────────────── 공통 유틸 사용 ──────────────
+# ────────────── 공통 유틸 ──────────────
 from utils import (
     setup_logging,
     OUTPUT_DIR,
@@ -17,9 +17,39 @@ from utils import (
     find_latest_file,
 )
 
+# ────────────── notifier 연동 ──────────────
+from notifier import (
+    DiscordLogHandler,
+    WEBHOOK_URL,
+    is_valid_webhook,
+    send_discord_message,
+)
+
 # ────────────── 로깅 ──────────────
 setup_logging()
 logger = logging.getLogger("gpt_analyzer")
+
+# 루트 로거에 디스코드 에러 핸들러 장착(중복 방지)
+_root = logging.getLogger()
+if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+    if not any(isinstance(h, DiscordLogHandler) for h in _root.handlers):
+        _root.addHandler(DiscordLogHandler(WEBHOOK_URL))
+        logger.info("DiscordLogHandler attached to root logger.")
+else:
+    logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
+
+# ── 간단 쿨다운(스팸 방지) ──
+_last_sent: Dict[str, float] = {}
+def _notify(content: str, key: str, cooldown_sec: int = 120):
+    try:
+        now = time.time()
+        if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
+            _last_sent[key] = now
+            if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+                send_discord_message(content=content)
+    except Exception:
+        # 알림 실패가 전체 파이프라인을 막지 않도록 무시
+        pass
 
 # ────────────── .env 로딩 ──────────────
 def _load_env() -> None:
@@ -70,10 +100,15 @@ try:
     if _api_key:
         client = OpenAI(api_key=_api_key)
         _OPENAI_AVAILABLE = True
+        logger.info("OpenAI 클라이언트 초기화 완료.")
     else:
         _OPENAI_AVAILABLE = False
-except Exception:
+        logger.warning("OPENAI_API_KEY 미설정. 휴리스틱 모드로 동작합니다.")
+        _notify("ℹ️ OPENAI_API_KEY 미설정 → 휴리스틱 분석으로 진행", key="gpt_analyzer_no_api", cooldown_sec=600)
+except Exception as e:
     _OPENAI_AVAILABLE = False
+    logger.warning(f"OpenAI 초기화 실패: {e}")
+    _notify(f"ℹ️ OpenAI 초기화 실패 → 휴리스틱 분석으로 진행\n```{str(e)[:400]}```", key="gpt_analyzer_openai_fail", cooldown_sec=600)
 
 # ────────────── 프롬프트 템플릿 ──────────────
 INITIAL_FILTER_PROMPT_TMPL = (
@@ -214,6 +249,7 @@ def _call_openai_json(system_prompt: str, user_prompt: str) -> Optional[dict]:
         return _safe_json_loads(_strip_to_json(txt))
     except Exception as e:
         logger.warning(f"OpenAI 호출 실패: {e}")
+        _notify(f"⚠️ OpenAI 호출 실패: {str(e)[:400]}", key="gpt_analyzer_call_fail", cooldown_sec=300)
         return None
 
 def _pretty_print_plans(plans: List[Dict]) -> None:
@@ -352,25 +388,37 @@ def run_pipeline(
     market: str = "KOSPI",
     available_slots: int = 3
 ) -> Optional[Path]:
+    start_msg = f"🧠 GPT 분석 시작 (date={fixed_date or 'auto'}, market={market}, slots={available_slots})"
+    logger.info(start_msg)
+    _notify(start_msg, key="gpt_analyzer_start", cooldown_sec=60)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if not fixed_date:
         latest = find_latest_file("screener_results_*_*.json")
         if not latest:
-            logger.error("screener_results_*.json 파일을 찾지 못했습니다.")
+            msg = "screener_results_*.json 파일을 찾지 못했습니다."
+            logger.error(msg)
+            _notify(f"❌ {msg}", key="gpt_analyzer_missing_screener", cooldown_sec=120)
             return None
         parts = latest.stem.split("_")
         fixed_date, market = (parts[-2], parts[-1]) if len(parts) >= 4 else (None, market)
         if not fixed_date:
-            logger.error(f"파일명에서 날짜/시장 추출 실패: {latest.name}")
+            msg = f"파일명에서 날짜/시장 추출 실패: {latest.name}"
+            logger.error(msg)
+            _notify(f"❌ {msg}", key="gpt_analyzer_parse_fail", cooldown_sec=120)
             return None
 
     screener_file, news_file = _detect_files(fixed_date, market)
     if not screener_file.exists():
-        logger.error(f"스크리너 결과 없음: {screener_file}")
+        msg = f"스크리너 결과 없음: {screener_file.name}"
+        logger.error(msg)
+        _notify(f"❌ {msg}", key="gpt_analyzer_no_screener", cooldown_sec=120)
         return None
     if not news_file.exists():
-        logger.error(f"뉴스 결과 없음: {news_file} (먼저 news_collector 실행 필요)")
+        msg = f"뉴스 결과 없음: {news_file.name} (먼저 news_collector 실행 필요)"
+        logger.error(msg)
+        _notify(f"❌ {msg}", key="gpt_analyzer_no_news", cooldown_sec=120)
         return None
 
     logger.info(f"로드: {screener_file.name}, {news_file.name}")
@@ -386,6 +434,21 @@ def run_pipeline(
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(plans or [], f, ensure_ascii=False, indent=2)
     logger.info(f"저장 완료 → {out_path}")
+
+    # 결과 요약 노티(상위 3개만)
+    try:
+        if plans:
+            top = plans[:min(3, len(plans))]
+            lines = [f"✅ GPT 분석 완료: {len(plans)}건 생성 (date={fixed_date}, {market})", "Top:"]
+            for p in top:
+                s = p.get("stock_info", {})
+                lines.append(f"- {s.get('Name','N/A')}({str(s.get('Ticker','N/A')).zfill(6)}): {p.get('결정')} / {p.get('전략_클래스')}")
+            _notify("\n".join(lines), key="gpt_analyzer_done", cooldown_sec=60)
+        else:
+            _notify(f"ℹ️ GPT 분석 완료: 생성된 계획 없음 (date={fixed_date}, {market})", key="gpt_analyzer_done_empty", cooldown_sec=60)
+    except Exception:
+        _notify(f"✅ GPT 분석 완료 (요약 구성 실패) (date={fixed_date}, {market})", key="gpt_analyzer_done", cooldown_sec=60)
+
     return out_path
 
 # ────────────── CLI ──────────────

@@ -5,6 +5,7 @@
 - KIS API로 잔고/요약 조회 후 JSON 저장
 - 같은 날짜(KST)로 재실행 시 동일 파일명으로 '덮어쓰기' 동작
 - 각 JSON에 컬럼 주석(comments) 포함
+- notifier.py 연동: 시작/성공/에러 디스코드 알림 + ERROR 이상 로그 자동 전송
 """
 
 import pprint
@@ -21,17 +22,34 @@ from utils import (
 # KIS API 모듈
 from api.kis_auth import KIS
 
+# 디스코드 알림
+from notifier import DiscordLogHandler, WEBHOOK_URL, send_discord_message
 
 # ───────────────── 로깅 설정 ─────────────────
 setup_logging()
 logger = logging.getLogger("Account")
 
+# 루트 로거에 DiscordLogHandler 부착(중복 방지)
+_root = logging.getLogger()
+if WEBHOOK_URL and WEBHOOK_URL.startswith(("http://", "https://")):
+    if not any(isinstance(h, DiscordLogHandler) for h in _root.handlers):
+        _root.addHandler(DiscordLogHandler(WEBHOOK_URL))
+        logger.info("DiscordLogHandler attached to root logger.")
+else:
+    logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
+
+def _notify(msg: str):
+    """실패해도 파이프라인 막지 않도록 안전 전송"""
+    try:
+        if WEBHOOK_URL and WEBHOOK_URL.startswith(("http://", "https://")):
+            send_discord_message(content=msg)
+    except Exception:
+        pass
 
 # ───────────────── 유틸리티 함수 ─────────────────
 def get_today_tag() -> str:
     """파일명에 사용할 날짜 태그 (YYYYMMDD) - KST 기준."""
     return datetime.now(KST).strftime("%Y%m%d")
-
 
 def build_balance_comments() -> dict:
     """df_balance 컬럼 설명(주석) 사전."""
@@ -46,7 +64,6 @@ def build_balance_comments() -> dict:
         "evlu_pfls_rt": "평가손익률 (%)",
     }
 
-
 def build_summary_comments() -> dict:
     """df_summary 컬럼 설명(주석) 사전."""
     return {
@@ -56,7 +73,6 @@ def build_summary_comments() -> dict:
         "pchs_amt_smtl_amt": "매입 금액 합계",
         "evlu_pfls_smtl_amt": "평가 손익 합계",
     }
-
 
 def dump_with_comments(filepath, comments: dict, df) -> None:
     """
@@ -70,10 +86,24 @@ def dump_with_comments(filepath, comments: dict, df) -> None:
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+def _to_int(v) -> int:
+    """문자/숫자 혼합 금액 안전 파싱"""
+    try:
+        if v is None:
+            return 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).replace(",", "").strip()
+        return int(float(s)) if s else 0
+    except Exception:
+        return 0
 
 # ───────────────── 메인 ─────────────────
 if __name__ == "__main__":
     try:
+        today = get_today_tag()
+        _notify(f"💼 계좌 조회 시작 (date={today})")
+
         # 설정 파일 로드 (src/utils.load_config)
         settings = load_config()
         trading_env = settings.get("trading_environment", "mock")
@@ -99,8 +129,7 @@ if __name__ == "__main__":
 
         # 응답 검증
         if df_summary is None or df_summary.empty:
-            logger.critical("❌ KIS API로부터 계좌 요약 정보(summary)를 가져오는 데 실패했습니다.")
-            sys.exit(1)
+            raise RuntimeError("KIS API로부터 계좌 요약 정보(summary)를 가져오는 데 실패했습니다.")
 
         # 콘솔 출력
         logger.info("\n--- 보유 종목 현황 ---")
@@ -113,9 +142,8 @@ if __name__ == "__main__":
         recs = df_summary.to_dict("records")
         pprint.pprint(recs[0] if recs else {})
 
-        # JSON 저장 (src/utils.OUTPUT_DIR 사용) — 같은날 재실행 시 덮어쓰기
+        # JSON 저장 — 같은날 재실행 시 덮어쓰기
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        today = get_today_tag()
 
         balance_file = OUTPUT_DIR / f"balance_{today}.json"
         summary_file = OUTPUT_DIR / f"summary_{today}.json"
@@ -127,6 +155,30 @@ if __name__ == "__main__":
         logger.info("- 보유 종목: %s", balance_file)
         logger.info("- 계좌 요약: %s", summary_file)
 
-    except Exception:
-        logger.critical("account.py 실행 중 심각한 오류 발생", exc_info=True)
+        # 성공 요약 디스코드 노티
+        try:
+            summ = recs[0] if recs else {}
+            cash_d2 = _to_int(summ.get("prvs_rcdl_excc_amt"))
+            cash_tot = _to_int(summ.get("dnca_tot_amt"))
+            tot_eval = _to_int(summ.get("tot_evlu_amt"))
+            hold_cnt = 0 if df_balance is None or df_balance.empty else len(df_balance)
+            _notify(
+                "✅ 계좌 조회 완료\n"
+                f"- 보유종목: {hold_cnt}개\n"
+                f"- D+2 출금가능: {cash_d2:,}원\n"
+                f"- 예수금: {cash_tot:,}원\n"
+                f"- 총평가: {tot_eval:,}원\n"
+                f"- files: {balance_file.name}, {summary_file.name}"
+            )
+        except Exception:
+            _notify("✅ 계좌 조회 완료 (요약 구성 실패)")
+
+    except Exception as e:
+        # 루트 로거에 붙은 DiscordLogHandler가 ERROR 이상 자동 전송함
+        logger.critical("account.py 실행 중 심각한 오류 발생: %s", e, exc_info=True)
+        # 추가로 간단 알림(중복 가능성 있으나 명시적 알림 선호 시 유지)
+        try:
+            _notify(f"❌ account.py 실패: {str(e)[:400]}")
+        except Exception:
+            pass
         sys.exit(1)

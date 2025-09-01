@@ -135,7 +135,6 @@ class Trader:
             return {'ok': False, 'msg1': str(e), 'error': str(e)}
 
     def get_account_info_from_files(self) -> Tuple[int, List[Dict]]:
-        # ... (이전과 동일한 내용, 단 find_latest_file은 utils에서 임포트) ...
         available_cash = 0
         summary_file = find_latest_file("summary_*.json")
 
@@ -144,46 +143,39 @@ class Trader:
         else:
             logger.info(f"가용 예산 조회를 위해 summary 파일 읽기: {summary_file}")
             try:
-                if summary_file.stat().st_size == 0:
-                    logger.warning(f"{summary_file.name} 파일이 비어있습니다. 가용 예산을 0으로 처리합니다.")
-                    summary_data = {}
-                else:
-                    with open(summary_file, 'r', encoding='utf-8') as f:
-                        summary_data = json.load(f).get("data", json.load(f))
+                with open(summary_file, 'r', encoding='utf-8') as f:
+                    summary_json = json.load(f)
                 
-                core_data = None
-                if isinstance(summary_data, dict):
-                    data_list = summary_data.get("data", [])
-                    if data_list and isinstance(data_list[0], dict):
-                        first_elem = data_list[0]
-                        core_data = first_elem.get("0", first_elem)
-                elif isinstance(summary_data, list):
-                    if summary_data:
-                        first_elem = summary_data[0]
-                        if isinstance(first_elem, dict):
-                            core_data = first_elem.get("0", first_elem)
-                
-                if isinstance(core_data, dict):
+                # 중첩된 JSON 구조 파싱: data -> list[0] -> "0"
+                summary_data = summary_json.get("data", [])
+                core_data = {}
+                if summary_data and isinstance(summary_data, list) and isinstance(summary_data[0], dict):
+                    core_data = summary_data[0].get("0", summary_data[0])
+
+                if core_data and isinstance(core_data, dict):
+                    # 우선순위에 따라 가용 현금 키 탐색
                     cash_keys_priority = ["prvs_rcdl_excc_amt", "nxdy_excc_amt", "ord_psbl_cash", "dnca_tot_amt"]
                     found_key, cash_str = None, "0"
+                    
                     for key in cash_keys_priority:
                         if key in core_data and core_data[key]:
                             cash_str = core_data[key]
                             found_key = key
                             logger.info(f"가용 예산 키 '{found_key}' 발견. 값: '{cash_str}'")
                             break
+                    
                     if not found_key:
                         logger.warning(f"우선순위 키를 찾지 못했습니다. 사용 가능한 키: {list(core_data.keys())}")
+
                     available_cash = self._parse_krw(cash_str)
                     logger.info(f"✅ 최종 파싱된 가용 예산: {available_cash:,} 원")
                 else:
-                    if summary_data:
-                        logger.error("summary.json 파일에서 유효한 데이터 구조(dict)를 찾지 못했습니다.")
+                    logger.error("summary.json 파일에서 유효한 데이터 구조(data -> [0] -> '0')를 찾지 못했습니다.")
 
             except json.JSONDecodeError as e:
                 logger.error(f"{summary_file.name} 파일이 비어있거나 형식이 잘못되었습니다: {e}")
             except Exception as e:
-                logger.error(f"{summary_file.name} 파일 처리 중 심각한 오류: {e}", exc_info=True)
+                logger.error(f"{summary_file.name} 파일 처리 중 오류 발생: {e}", exc_info=True)
 
         holdings = []
         balance_file = find_latest_file("balance_*.json")
@@ -191,22 +183,13 @@ class Trader:
             logger.warning("balance.json 파일을 찾을 수 없어 보유 종목이 없는 것으로 간주합니다.")
         else:
             try:
-                if balance_file.stat().st_size == 0:
-                     logger.warning(f"{balance_file.name} 파일이 비어있습니다. 보유 종목이 없는 것으로 간주합니다.")
-                     holdings_data = []
-                else:
-                    with open(balance_file, 'r', encoding='utf-8') as f:
-                        balance_json = json.load(f)
-                    
-                    if isinstance(balance_json, dict) and "data" in balance_json:
-                        holdings_data = balance_json["data"]
-                    elif isinstance(balance_json, list):
-                        holdings_data = balance_json
-                    else:
-                        holdings_data = []
+                with open(balance_file, 'r', encoding='utf-8') as f:
+                    balance_json = json.load(f)
                 
+                holdings_data = balance_json.get("data", [])
                 holdings = [h for h in holdings_data if self._parse_krw(h.get("hldg_qty", 0)) > 0]
                 logger.info(f"보유 종목 로드 완료: 총 {len(holdings_data)}개 항목 중 유효 보유 {len(holdings)} 종목 (from {balance_file.name})")
+
             except json.JSONDecodeError as e:
                 logger.error(f"{balance_file.name} 파일이 비어있거나 형식이 잘못되었습니다: {e}")
             except Exception as e:

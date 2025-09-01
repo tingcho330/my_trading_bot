@@ -89,7 +89,7 @@ def run_trading_pipeline():
     logger.info("파이프라인 한 사이클을 종료합니다.")
 
 if __name__ == "__main__":
-    schedule.every().monday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
+    schedule.every().monday.at("11:30", "Asia/Seoul").do(run_trading_pipeline)
     schedule.every().tuesday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
     schedule.every().wednesday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)
     schedule.every().thursday.at("10:00", "Asia/Seoul").do(run_trading_pipeline)

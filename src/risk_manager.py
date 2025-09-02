@@ -3,8 +3,9 @@ import os
 import json
 import logging
 import subprocess
+import time as pytime
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as dt_time, timedelta
 from typing import Dict, Tuple, Optional, List
 
 # ── 공통 유틸/노티파이어 ────────────────────────────────────────────────
@@ -21,7 +22,15 @@ from notifier import (
     send_discord_message,
 )
 
+# ── 계산 전용 코어 모듈 사용 ───────────────────────────────────────────
+from screener_core import (
+    _compute_levels,          # 손절/목표가 계산 (ATR/스윙 기반, 퍼센트 백업)
+    get_historical_prices,    # 과거 시세 조회 (pykrx 우선, fdr 백업)
+    calculate_rsi,            # RSI 계산
+)
+
 logger = logging.getLogger("RiskManager")
+logger.setLevel(logging.INFO)
 
 # 루트 로거에 디스코드 에러 핸들러 장착(중복 방지)
 _root = logging.getLogger()
@@ -33,6 +42,18 @@ else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
 ACCOUNT_SCRIPT_PATH = "/app/src/account.py"
+
+# ── 장중 정의(평일 09:00~15:30) ────────────────────────────────────────
+MARKET_START = dt_time(9, 0)
+MARKET_END   = dt_time(15, 30)
+
+def is_market_hours() -> bool:
+    """평일 09:00~15:30 (KST) 에만 True"""
+    now = datetime.now(KST)
+    if now.weekday() > 4:  # 0=월 ~ 4=금
+        return False
+    now_t = now.time()
+    return MARKET_START <= now_t <= MARKET_END
 
 # ── 데이터 클래스: 규칙 파라미터 ─────────────────────────────────────────
 @dataclass
@@ -49,7 +70,10 @@ def _to_int(x) -> int:
         return int(x)
     if isinstance(x, str):
         s = x.replace(",", "").strip()
-        return int(s) if s.isdigit() else 0
+        try:
+            return int(float(s))
+        except Exception:
+            return 0
     return 0
 
 def _to_float(x, default: float = 0.0) -> float:
@@ -88,15 +112,50 @@ class RiskManager:
         self.rules = SellRules(
             stop_loss_buffer=float(rp.get("stop_loss_buffer", 0.0)),
             take_profit_buffer=float(rp.get("take_profit_buffer", 0.0)),
-            rsi_take_profit=(
-                float(rp["rsi_take_profit"]) if rp.get("rsi_take_profit") is not None else None
-            ),
-            max_holding_days=(
-                int(rp["max_holding_days"]) if rp.get("max_holding_days") is not None else None
-            ),
+            rsi_take_profit=(float(rp["rsi_take_profit"]) if rp.get("rsi_take_profit") is not None else None),
+            max_holding_days=(int(rp["max_holding_days"]) if rp.get("max_holding_days") is not None else None),
         )
 
         logger.info(f"🛡️ RiskManager 초기화 완료 (env={self.env})")
+
+    # ── screener_core 호출로 실시간 지표/레벨 ───────────────────────────
+    def compute_realtime_levels(self, ticker: str, entry_price: float) -> Dict:
+        """
+        손절가/목표가/RSI 계산(파일 참조 없이 함수 호출).
+        - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
+        """
+        out: Dict = {"Ticker": str(ticker).zfill(6), "Price": int(round(float(entry_price)))}
+
+        # 1) 손절/목표가
+        try:
+            date_str = datetime.now(KST).strftime("%Y%m%d")
+            risk_params = self.config.get("risk_params", {}) or {}
+            levels = _compute_levels(str(ticker).zfill(6), float(entry_price), date_str, risk_params)
+            if isinstance(levels, dict):
+                out.update({k: levels.get(k) for k in ("손절가", "목표가", "source") if k in levels})
+        except Exception as e:
+            logger.warning(f"[{ticker}] 손절/목표가 계산 실패: {e}")
+
+        # 2) RSI
+        try:
+            end_dt = datetime.now(KST)
+            start_dt = end_dt - timedelta(days=365)
+            df = get_historical_prices(
+                str(ticker).zfill(6),
+                start_dt.strftime("%Y%m%d"),
+                end_dt.strftime("%Y%m%d"),
+            )
+            if df is not None and not df.empty:
+                close_col = "Close" if "Close" in df.columns else [c for c in df.columns if c.lower() == "close"][0]
+                rsi_val = float(calculate_rsi(df[close_col]))
+                out["RSI"] = round(rsi_val, 2)
+            else:
+                out["RSI"] = 50.0
+        except Exception as e:
+            logger.warning(f"[{ticker}] RSI 계산 실패: {e}")
+            out["RSI"] = 50.0
+
+        return out
 
     # ── 계좌 스냅샷 로드/트리거 ────────────────────────────────────────
     def refresh_account_snapshot(self) -> Tuple[Dict[str, int], List[Dict], Optional[str], Optional[str]]:
@@ -105,7 +164,6 @@ class RiskManager:
         return: (cash_info_dict, holdings_list, summary_file, balance_file)
         """
         try:
-            # account.py 실행 (성공/실패와 무관하게 읽기 재시도)
             subprocess.run(
                 ["python", str(ACCOUNT_SCRIPT_PATH)],
                 capture_output=True,
@@ -121,15 +179,12 @@ class RiskManager:
         except Exception as e:
             logger.error(f"(RiskManager) account.py 실행 중 예외: {e}")
 
-        # 최신 파일 읽기(재시도 포함)
         summary_dict, balance_list, summary_path, balance_path = load_account_files_with_retry(
             summary_pattern="summary_*.json",
             balance_pattern="balance_*.json",
             max_wait_sec=5,
         )
-        # 현금 파싱
         cash_map = extract_cash_from_summary(summary_dict)
-        # 파일명(문자열)만 반환
         return (
             cash_map,
             balance_list,
@@ -143,7 +198,6 @@ class RiskManager:
         보유 종목/스크리너 정보 기반 매도 판단.
         return: ("SELL" or "HOLD", reason)
         """
-        # 필수 데이터 정리
         ticker = str(holding.get("pdno", "")).zfill(6)
         name = holding.get("prdt_name", "N/A")
         qty = _to_int(holding.get("hldg_qty", 0))
@@ -151,39 +205,24 @@ class RiskManager:
         if qty <= 0 or cur_price <= 0:
             return "HOLD", f"{name}({ticker}) 수량/가격 정보 부족"
 
-        # 스크리너 정보 (손절가/목표가/RSI 등)
         stop_px = _to_float(stock_info.get("손절가"), 0.0)
         take_px = _to_float(stock_info.get("목표가"), 0.0)
         rsi = _to_float(stock_info.get("RSI"), 50.0)
-        entry_px = _to_float(stock_info.get("Price"), cur_price)  # 진입가 없는 경우 현재가로 fallback
 
-        # 버퍼 적용 손절/목표 기준
-        if self.rules.stop_loss_buffer and stop_px > 0:
-            stop_threshold = stop_px * (1.0 + self.rules.stop_loss_buffer)
-        else:
-            stop_threshold = stop_px
+        # 버퍼 적용
+        stop_threshold = stop_px * (1.0 + self.rules.stop_loss_buffer) if (self.rules.stop_loss_buffer and stop_px > 0) else stop_px
+        tp_threshold   = take_px * (1.0 - self.rules.take_profit_buffer) if (self.rules.take_profit_buffer and take_px > 0) else take_px
 
-        if self.rules.take_profit_buffer and take_px > 0:
-            tp_threshold = take_px * (1.0 - self.rules.take_profit_buffer)
-        else:
-            tp_threshold = take_px
-
-        # 1) 손절 조건: 현재가 <= 손절가(버퍼 적용)
+        # 1) 손절
         if stop_threshold > 0 and cur_price <= stop_threshold:
-            return "SELL", f"손절가 도달({cur_price} ≤ {int(stop_threshold)})"
-
-        # 2) 목표가 도달: 현재가 ≥ 목표가(버퍼 적용)
+            return "SELL", f"손절가 도달({cur_price:,} ≤ {int(stop_threshold):,})"
+        # 2) 목표가
         if tp_threshold > 0 and cur_price >= tp_threshold:
-            return "SELL", f"목표가 도달({cur_price} ≥ {int(tp_threshold)})"
-
-        # 3) RSI 이익실현
+            return "SELL", f"목표가 도달({cur_price:,} ≥ {int(tp_threshold):,})"
+        # 3) RSI 과열
         if self.rules.rsi_take_profit is not None and rsi >= float(self.rules.rsi_take_profit):
-            # 목표가가 없거나 멀다면 RSI 단독 기준으로도 정리
             return "SELL", f"RSI 과열({rsi:.1f}≥{float(self.rules.rsi_take_profit):.1f})"
-
-        # 4) 보유일수 상한 검사(거래 기록 DB로부터 체결일을 알 수 있다면 적용)
-        # trader.recorder에 parent_trade_id 등 기록 시 가져와 판단 가능.
-        # 여기서는 stock_info에 가상의 'entry_date'가 있을 경우만 예시 적용.
+        # 4) 보유일수 상한
         if self.rules.max_holding_days and stock_info.get("entry_date"):
             try:
                 dt = datetime.fromisoformat(str(stock_info["entry_date"]))
@@ -193,21 +232,14 @@ class RiskManager:
             except Exception:
                 pass
 
-        # (선택) 추세 역전 등 기술적 보조 룰을 추가하고 싶다면 여기에 확장
-        # ex) 20일선 하향, 패턴 플래그 역진 등…
-
         return "HOLD", f"유지: {name}({ticker}) 현재가={cur_price:,}, 손절={int(stop_px) if stop_px else 'N/A'}, 목표={int(take_px) if take_px else 'N/A'}, RSI={rsi:.1f}"
 
-    # ── 상태 요약(디스코드용) ──────────────────────────────────────────
+    # ── 상태 요약(디스코드/로그) ────────────────────────────────────────
     def summarize_account_state(self, cash_map: Dict[str, int], holdings: List[Dict]) -> str:
-        """
-        디스코드/로그용 간단 요약 문자열 생성
-        """
         d2 = cash_map.get("prvs_rcdl_excc_amt", 0)
         nx = cash_map.get("nxdy_excc_amt", 0)
         dn = cash_map.get("dnca_tot_amt", 0)
         total = cash_map.get("tot_evlu_amt", 0) or 0
-
         return (
             f"보유종목: {len([h for h in holdings if _to_int(h.get('hldg_qty', 0))>0])}개\n"
             f"D+2 출금가능: {d2:,}원\n"
@@ -216,8 +248,13 @@ class RiskManager:
             f"총평가(요약): {total:,}원"
         )
 
-# ── 단독 실행 테스트(선택) ─────────────────────────────────────────────
+# ── 단독 실행: 장중 3분 간격 모니터링 루프 ─────────────────────────────
 if __name__ == "__main__":
+    # 장중 가드: 평일 09:00~15:30 외에는 아예 실행하지 않음
+    if not is_market_hours():
+        logger.info(f"({datetime.now(KST):%Y-%m-%d %H:%M:%S}) 장중이 아니므로 RiskManager 실행을 종료합니다.")
+        raise SystemExit(0)
+
     # settings 모듈이 없을 수도 있으므로 가짜 설정으로 구동 테스트
     class _DummySettings:
         _config = {
@@ -227,18 +264,46 @@ if __name__ == "__main__":
                 "take_profit_buffer": 0.0,
                 "rsi_take_profit": 75,
                 "max_holding_days": None,
+                # screener_core._compute_levels 에서 사용하는 키들(없어도 퍼센트 백업 경로 동작)
+                "atr_period": 14,
+                "atr_k_stop": 1.5,
+                "swing_lookback": 20,
+                "reward_risk": 2.0,
+                "stop_pct": 0.03,
             }
         }
 
     rm = RiskManager(_DummySettings())
+    logger.info("📡 RiskManager 모니터링 루프 시작 (3분 간격)")
 
-    # 계좌 스냅샷 갱신 및 요약 출력
-    cash, holds, s_path, b_path = rm.refresh_account_snapshot()
-    msg = rm.summarize_account_state(cash, holds)
-    logger.info("\n" + msg + f"\nfiles: {b_path}, {s_path}")
+    while True:
+        # 장 종료 시 루프 종료
+        if not is_market_hours():
+            logger.info(f"({datetime.now(KST):%Y-%m-%d %H:%M:%S}) 장 종료 → RiskManager 모니터링 루프 종료")
+            break
 
-    # 더미 매도 판단 테스트
-    dummy_holding = {"pdno": "005930", "prdt_name": "삼성전자", "hldg_qty": "10", "prpr": "71000"}
-    dummy_info = {"손절가": 68000, "목표가": 76000, "RSI": 73.2, "Price": 70000}
-    decision, reason = rm.check_sell_condition(dummy_holding, dummy_info)
-    logger.info(f"매도 판단 → {decision}: {reason}")
+        # 1) 계좌 스냅샷 갱신 및 요약 로그
+        cash, holds, s_path, b_path = rm.refresh_account_snapshot()
+        msg = rm.summarize_account_state(cash, holds)
+        logger.info("\n" + msg + f"\nfiles: {b_path}, {s_path}")
+
+        # 2) 각 보유 종목: 손절/목표가/RSI 즉시 계산 후 판단
+        if holds:
+            for h in holds:
+                ticker = str(h.get("pdno", "")).zfill(6)
+                cur_price = _to_float(h.get("prpr"), 0.0)
+                if cur_price <= 0:
+                    logger.info(f"유지 판단: {h.get('prdt_name','N/A')}({ticker}) 현재가 정보 없음")
+                    continue
+
+                stock_info = rm.compute_realtime_levels(ticker, cur_price)
+                decision, reason = rm.check_sell_condition(h, stock_info)
+                if decision == "SELL":
+                    log_msg = f"🚨 매도 판단: {reason}"
+                    logger.warning(log_msg)
+                    _notify(log_msg)
+                else:
+                    logger.info(f"유지 판단: {reason}")
+
+        logger.info("⏳ 3분 대기 후 다음 주기 실행")
+        pytime.sleep(180)  # 3분(180초) 간격

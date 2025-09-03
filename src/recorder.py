@@ -124,7 +124,7 @@ def _migrate_db_schema(conn: sqlite3.Connection):
         """
     )
 
-    # 2) 컬럼 누락 시 추가
+    # 2) 컬럼 누락 시 추가 (개선된 부분)
     REQUIRED_COLS = {
         "trades": {
             "gpt_summary": "TEXT",
@@ -132,6 +132,8 @@ def _migrate_db_schema(conn: sqlite3.Connection):
             "strategy_details": "TEXT",
             "trade_status": "TEXT",
             "pnl_amount": "REAL",
+            "gpt_score": "REAL", # GPT 점수
+            "sell_reason": "TEXT"  # 매도 사유
         }
     }
 
@@ -170,13 +172,26 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
         if isinstance(gpt_analysis_data, dict)
         else gpt_analysis_data
     )
+    
+    # --- 개선된 부분 ---
+    # gpt_analysis에서 score 추출
+    gpt_score = None
+    if isinstance(gpt_analysis_data, dict):
+        # 'stock_info' 안에 'Score'가 있을 수 있음
+        stock_info = gpt_analysis_data.get("stock_info", {})
+        if "Score" in stock_info:
+            gpt_score = stock_info.get("Score")
+        # 또는 gpt_analysis 최상위에 있을 수도 있음
+        elif "Overall Score" in gpt_analysis_data:
+            gpt_score = gpt_analysis_data.get("Overall Score")
 
     sql = """
         INSERT INTO trades (
             timestamp, side, ticker, name, qty, price,
             pnl_amount, parent_trade_id, strategy_name, trade_status,
-            strategy_details, gpt_summary, gpt_analysis
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            strategy_details, gpt_summary, gpt_analysis,
+            gpt_score, sell_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
     ts = datetime.now(KST).isoformat()
@@ -196,7 +211,10 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
         else None,
         trade_data.get("gpt_summary"),
         gpt_analysis_json,
+        gpt_score, # gpt_score 추가
+        trade_data.get("sell_reason") # sell_reason 추가
     )
+    # --- 여기까지 ---
 
     try:
         with get_db_connection(db_path) as conn:
@@ -340,6 +358,7 @@ if __name__ == '__main__':
         "strategy_name": "RsiReversalStrategy",
         "trade_status": "completed",
         "strategy_details": {"RSI": 75, "reason": "RSI 과매수 구간 진입"},
+        "sell_reason": "RSI 과매수 구간 진입"
     }
 
     # 1. 매수 기록 테스트

@@ -28,19 +28,14 @@ logger = logging.getLogger("news_collector")
 
 # ───────────────── .env 로딩 (고정 경로 + 폴백) ─────────────────
 def load_env_with_fallback() -> str:
-    """
-    /app/config/.env 우선 → 파일 기준 후보 → CWD 후보 → find_dotenv 순으로 탐색.
-    로드 성공 시 경로 문자열을 반환, 없으면 빈 문자열 반환.
-    """
     candidates = [
-        Path("/app/config/.env"),                                    # 절대 경로 우선
-        Path(__file__).resolve().parents[1] / "config" / ".env",     # .../src → /app/config/.env
-        Path(__file__).resolve().parent / "config" / ".env",         # 현재 폴더 하위 config/.env
-        Path(__file__).resolve().parent / ".env",                    # 현재 폴더 .env
-        Path.cwd() / "config" / ".env",                              # CWD/config/.env
-        Path.cwd() / ".env",                                         # CWD/.env
+        Path("/app/config/.env"),
+        Path(__file__).resolve().parents[1] / "config" / ".env",
+        Path(__file__).resolve().parent / "config" / ".env",
+        Path(__file__).resolve().parent / ".env",
+        Path.cwd() / "config" / ".env",
+        Path.cwd() / ".env",
     ]
-
     loaded = ""
     for p in candidates:
         try:
@@ -50,7 +45,6 @@ def load_env_with_fallback() -> str:
                     break
         except Exception:
             continue
-
     if not loaded:
         try:
             found = find_dotenv(usecwd=True)
@@ -59,11 +53,9 @@ def load_env_with_fallback() -> str:
                 loaded = found
         except Exception:
             pass
-
     logger.info(f".env loaded from: {loaded if loaded else 'None'}")
     return loaded
 
-# .env 로드 및 키 읽기
 _ = load_env_with_fallback()
 NAVER_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
 NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
@@ -79,12 +71,11 @@ def _clean_text(text: str) -> str:
     return " ".join(text.split())
 
 def _normalize_title(text: str) -> str:
-    """제목 정규화: 태그/엔티티 제거, 괄호 내용 제거, 접미 매체명 제거, 공백 정리."""
     if not text:
         return ""
     t = _clean_text(text)
-    t = re.sub(r"[\(\[\{（\[｛].*?[\)\]\}）\]｝]", " ", t)  # 괄호류 내용 제거
-    t = re.sub(r"\s*[-–—]\s*[^-–—]{0,20}$", " ", t)       # 끝의 ' - 매체명' 제거 시도
+    t = re.sub(r"[\(\[\{（\[｛].*?[\)\]\}）\]｝]", " ", t)
+    t = re.sub(r"\s*[-–—]\s*[^-–—]{0,20}$", " ", t)
     t = " ".join(t.split())
     return t
 
@@ -92,7 +83,6 @@ def _title_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 def _dedupe_items_by_title(items: List[Dict], threshold: float = DEDUPE_THRESHOLD) -> List[Dict]:
-    """제목 유사도로 중복 기사 제거(선입 우선). threshold 이상이면 중복으로 간주."""
     selected: List[Dict] = []
     norm_titles: List[str] = []
     for it in items:
@@ -109,7 +99,6 @@ def _dedupe_items_by_title(items: List[Dict], threshold: float = DEDUPE_THRESHOL
 
 # ───────────────── NAVER API / 스크레이핑 ─────────────────
 def _fetch_naver_news_api(keyword: str, num_articles: int) -> List[Dict]:
-    """NAVER 키가 없으면 빈 리스트 반환(예외 X). 호출부는 빈 결과를 적절히 처리."""
     if not (NAVER_ID and NAVER_SECRET):
         return []
     url = "https://openapi.naver.com/v1/search/news.json"
@@ -150,12 +139,10 @@ def _scrape_article_content(url: str) -> str:
         return "본문을 가져오지 못했습니다."
 
 def _parse_pubdate(pub: str) -> datetime:
-    # 예: 'Fri, 30 Aug 2025 12:34:56 +0900'
     dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
     return dt.astimezone(timezone.utc)
 
 def _normalize_stock_dict(d: Dict) -> Dict:
-    """screener 결과 키 정규화: Ticker/Name 보정"""
     out = dict(d)
     if not out.get("Ticker"):
         if out.get("Code"):
@@ -173,16 +160,21 @@ def _normalize_stock_dict(d: Dict) -> Dict:
 def _fetch_news_for_single_stock(
     stock: Dict, cutoff_utc: datetime, num_articles: int
 ) -> Tuple[str, str]:
+    """
+    반환: (ticker, text)
+    - 데이터 부족 시 text는 '[NO_NEWS] ...' 형식으로 반환
+    - 오류 시 text는 '[ERROR] ...' 형식
+    """
     stock = _normalize_stock_dict(stock)
     name, ticker = stock.get("Name"), stock.get("Ticker")
     if not (name and ticker):
-        return (str(ticker) if ticker else ""), "종목 정보 누락"
+        return (str(ticker) if ticker else ""), "[NO_NEWS] 종목 정보 누락"
 
     try:
         # 1) API 호출
         items = _fetch_naver_news_api(f'"{name}"', 100)
         if not items:
-            return str(ticker), "뉴스 API 호출 결과 없음"
+            return str(ticker), "[NO_NEWS] 뉴스 API 호출 결과 없음"
 
         # 2) 기간 필터
         recent: List[Dict] = []
@@ -194,7 +186,7 @@ def _fetch_news_for_single_stock(
             except Exception:
                 continue
         if not recent:
-            return str(ticker), "최근 기간 내 뉴스가 없습니다."
+            return str(ticker), "[NO_NEWS] 최근 기간 내 뉴스 없음"
 
         # 3) 중복 제거 (제목 유사도)
         recent = _dedupe_items_by_title(recent, threshold=DEDUPE_THRESHOLD)
@@ -214,11 +206,14 @@ def _fetch_news_for_single_stock(
             parts.extend([f"링크: {link or 'N/A'}", f"본문: {content}"])
             articles.append("\n".join(parts))
 
+        if not articles:
+            return str(ticker), "[NO_NEWS] 기사 본문 수집 실패"
+
         return str(ticker), "\n\n---\n\n".join(articles)
 
     except Exception as e:
         logger.error(f"'{name}'({ticker}) 뉴스 수집 오류: {e}")
-        return str(ticker), "뉴스 수집 중 오류가 발생했습니다."
+        return str(ticker), "[ERROR] 뉴스 수집 중 오류 발생"
 
 def fetch_news_for_stocks(
     stocks: List[Dict],
@@ -226,31 +221,76 @@ def fetch_news_for_stocks(
     days: int = 90,
     max_workers: Optional[int] = None,
 ) -> Dict[str, str]:
+    """
+    항상 각 티커 키를 포함한 dict를 반환.
+    - 기본값은 '[NO_NEWS] 데이터 부족(수집 0건)'으로 채우고, 성공 시 덮어씀.
+    (저장 직전에 구조화 포맷으로 통일함)
+    """
     if not stocks:
         return {}
 
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
-    news_cache: Dict[str, str] = {}
     if max_workers is None:
         max_workers = max(1, min(10, len(stocks)))
 
-    logger.info(f"📰 {len(stocks)}개 종목 뉴스 병렬 수집 시작... (최근 {days}일)")
+    # 기본값: 모두 NO_NEWS로 초기화
+    base_map: Dict[str, str] = {}
+    norm_list: List[Dict] = []
+    for stock in stocks:
+        s = _normalize_stock_dict(stock)
+        t = str(s.get("Ticker", "")).zfill(6)
+        if t and s.get("Name"):
+            base_map[t] = "[NO_NEWS] 데이터 부족(수집 0건)"
+            norm_list.append({"Name": s["Name"], "Ticker": t})
+
+    news_cache: Dict[str, str] = dict(base_map)
+
+    logger.info(f"{len(norm_list)}개 종목 뉴스 병렬 수집 시작... (최근 {days}일)")
+    if not norm_list:
+        return news_cache
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(_fetch_news_for_single_stock, stock, cutoff_utc, num_articles_per_stock): str(_normalize_stock_dict(stock).get("Name", ""))
-            for stock in stocks
+            ex.submit(_fetch_news_for_single_stock, stock, cutoff_utc, num_articles_per_stock): str(stock.get("Name", ""))
+            for stock in norm_list
         }
         for fut in as_completed(futures):
             stock_name = futures[fut]
             try:
                 ticker, text = fut.result()
                 if ticker:
-                    news_cache[ticker] = text
+                    news_cache[ticker] = text or "[NO_NEWS] 빈 본문"
             except Exception as e:
                 logger.error(f"'{stock_name}' 처리 중 예외: {e}", exc_info=True)
 
-    logger.info(f"✅ {len(news_cache)}/{len(stocks)}개 종목 뉴스 완료")
+    logger.info(f"✅ 뉴스 수집 완료 (총 {len(news_cache)}종목)")
     return news_cache
+
+# ───────────────── 저장 전 포맷 통일 유틸 ─────────────────
+def _to_structured_news_map(news_data: Dict[str, object], all_tickers: List[str]) -> Dict[str, Dict[str, str]]:
+    """
+    다양한 형태의 news_data 값을 저장 전 통일:
+      - dict(status,text) → 그대로
+      - str 시작이 "[NO_NEWS]" → {"status":"NO_NEWS","text":<원문 또는 빈 문자열>}
+      - 그 외 str → {"status":"OK","text":<원문>}
+      - None/빈값/키없음 → {"status":"NO_NEWS","text":""}
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    for t in all_tickers:
+        v = news_data.get(t, None)
+        if isinstance(v, dict) and "status" in v and "text" in v:
+            out[t] = {"status": str(v.get("status")), "text": str(v.get("text") or "")}
+        elif isinstance(v, str):
+            s = v.strip()
+            if s.startswith("[NO_NEWS]"):
+                out[t] = {"status": "NO_NEWS", "text": s}
+            elif s.startswith("[ERROR]"):
+                out[t] = {"status": "ERROR", "text": s}
+            else:
+                out[t] = {"status": "OK", "text": s}
+        else:
+            out[t] = {"status": "NO_NEWS", "text": ""}
+    return out
 
 def run_news_collection_from_results_file(
     results_file: Path, num_articles_per_stock: int = 5, days: int = 90
@@ -261,7 +301,7 @@ def run_news_collection_from_results_file(
         logger.error(f"결과 파일({results_file})이 존재하지 않습니다.")
         return
 
-    stem = results_file.stem  # e.g., "screener_results_YYYYMMDD_KOSPI"
+    stem = results_file.stem  # e.g., "screener_candidates_YYYYMMDD_KOSPI"
     parts = stem.split("_")
     if len(parts) >= 4:
         fixed_date, market = parts[-2], parts[-1]
@@ -293,14 +333,20 @@ def run_news_collection_from_results_file(
     news_data = fetch_news_for_stocks(
         stocks_for_news, num_articles_per_stock=num_articles_per_stock, days=days
     )
+
+    # 파일 저장: 비어 있어도 NO_NEWS 기본값으로 저장되도록 보장
     if not news_data:
-        logger.warning("수집된 뉴스 없음.")
-        return
+        news_data = {s["Ticker"]: "[NO_NEWS] 데이터 부족(수집 0건)" for s in stocks_for_news}
 
     out_file = results_file.parent / f"collected_news_{fixed_date}_{market}.json"
     logger.info(f"저장 → {out_file}")
+
+    # ✅ 저장 직전: 모든 티커에 대해 구조화 포맷 보장 + 빈 값은 NO_NEWS 채움
+    all_tickers = [s['Ticker'] for s in stocks_for_news]
+    news_data_struct = _to_structured_news_map(news_data, all_tickers)
+
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(news_data, f, ensure_ascii=False, indent=2)
+        json.dump(news_data_struct, f, ensure_ascii=False, indent=2)
 
     logger.info(f"완료 (소요 {time.perf_counter() - t0:.2f}초)")
 
@@ -320,9 +366,14 @@ if __name__ == "__main__":
         )
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        latest = find_latest_file("screener_results_*.json")
+        latest = (
+            find_latest_file("screener_candidates_*.json")
+            or find_latest_file("screener_candidates_full_*.json")
+            or find_latest_file("screener_rank_*.json")
+            or find_latest_file("screener_rank_full_*.json")
+        )
         if latest is None:
-            logger.error("output/ 폴더에 screener_results_*.json 파일이 없습니다.")
+            logger.error("output/ 폴더에 screener_candidates_*.json 또는 screener_rank_*.json 파일이 없습니다.")
         else:
             logger.info(f"자동 선택: {latest.name}")
             run_news_collection_from_results_file(

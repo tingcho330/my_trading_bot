@@ -81,7 +81,7 @@ def get_db_connection(db_path: Optional[str] = None):
         if conn:
             conn.rollback()
         # 심각 오류 알림(쿨다운)
-        _notify(f"🧨 DB 트랜잭션 실패: {str(e)[:900]}", key="recorder_db_tx_fail", cooldown_sec=300)
+        _notify(f" DB 트랜잭션 실패: {str(e)[:900]}", key="recorder_db_tx_fail", cooldown_sec=300)
         raise
     finally:
         if conn:
@@ -119,12 +119,16 @@ def _migrate_db_schema(conn: sqlite3.Connection):
             trade_status    TEXT,
             strategy_details TEXT,
             gpt_summary     TEXT,
-            gpt_analysis    TEXT
+            gpt_analysis    TEXT,
+            gpt_score       REAL,
+            sell_reason     TEXT,
+            reason_code     TEXT,
+            levels_source   TEXT
         )
         """
     )
 
-    # 2) 컬럼 누락 시 추가 (개선된 부분)
+    # 2) 컬럼 누락 시 추가 (안전 보강)
     REQUIRED_COLS = {
         "trades": {
             "gpt_summary": "TEXT",
@@ -132,8 +136,11 @@ def _migrate_db_schema(conn: sqlite3.Connection):
             "strategy_details": "TEXT",
             "trade_status": "TEXT",
             "pnl_amount": "REAL",
-            "gpt_score": "REAL", # GPT 점수
-            "sell_reason": "TEXT"  # 매도 사유
+            "gpt_score": "REAL",
+            "sell_reason": "TEXT",
+            "reason_code": "TEXT",
+            "levels_source": "TEXT",
+            "parent_trade_id": "INTEGER",
         }
     }
 
@@ -155,7 +162,7 @@ def initialize_db(db_path: Optional[str] = None):
         logger.info("✅ DB 스키마 확인 & 마이그레이션 완료")
     except Exception as e:
         logger.critical(f"DB 초기화 실패: {e}", exc_info=True)
-        _notify(f"🧨 DB 초기화 실패: {str(e)[:900]}", key="recorder_db_init_fail", cooldown_sec=600)
+        _notify(f" DB 초기화 실패: {str(e)[:900]}", key="recorder_db_init_fail", cooldown_sec=600)
         raise
 
 # --------------------------------------------------------------------
@@ -169,19 +176,16 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
     gpt_analysis_data = trade_data.get("gpt_analysis")
     gpt_analysis_json = (
         json.dumps(gpt_analysis_data, ensure_ascii=False)
-        if isinstance(gpt_analysis_data, dict)
+        if isinstance(gpt_analysis_data, (dict, list))
         else gpt_analysis_data
     )
-    
-    # --- 개선된 부분 ---
-    # gpt_analysis에서 score 추출
+
+    # gpt_analysis에서 score 추출(가능 시)
     gpt_score = None
     if isinstance(gpt_analysis_data, dict):
-        # 'stock_info' 안에 'Score'가 있을 수 있음
         stock_info = gpt_analysis_data.get("stock_info", {})
         if "Score" in stock_info:
             gpt_score = stock_info.get("Score")
-        # 또는 gpt_analysis 최상위에 있을 수도 있음
         elif "Overall Score" in gpt_analysis_data:
             gpt_score = gpt_analysis_data.get("Overall Score")
 
@@ -190,8 +194,8 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
             timestamp, side, ticker, name, qty, price,
             pnl_amount, parent_trade_id, strategy_name, trade_status,
             strategy_details, gpt_summary, gpt_analysis,
-            gpt_score, sell_reason
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            gpt_score, sell_reason, reason_code, levels_source
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
     ts = datetime.now(KST).isoformat()
@@ -207,26 +211,27 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
         trade_data.get("strategy_name"),
         trade_data.get("trade_status"),
         json.dumps(trade_data.get("strategy_details"), ensure_ascii=False)
-        if trade_data.get("strategy_details")
+        if trade_data.get("strategy_details") is not None
         else None,
         trade_data.get("gpt_summary"),
         gpt_analysis_json,
-        gpt_score, # gpt_score 추가
-        trade_data.get("sell_reason") # sell_reason 추가
+        gpt_score,
+        trade_data.get("sell_reason"),
+        trade_data.get("reason_code"),
+        trade_data.get("levels_source"),
     )
-    # --- 여기까지 ---
 
     try:
         with get_db_connection(db_path) as conn:
             conn.execute(sql, params)
             conn.commit()
         # 로그 & (선택) 간단 알림
-        s = trade_data.get("side", "").upper()
+        s = (trade_data.get("side") or "").upper()
         name = trade_data.get("name")
         qty = trade_data.get("qty")
         logger.info(f"✅ 거래 기록: {s} {name} {qty}주 (ts={ts})")
 
-        # 임베드 알림(있으면)
+        # 임베드 알림(가능 시)
         try:
             embed = create_trade_embed({
                 "side": s,
@@ -235,20 +240,21 @@ def record_trade(trade_data: dict, db_path: Optional[str] = None):
                 "qty": trade_data.get("qty"),
                 "price": trade_data.get("price"),
                 "trade_status": trade_data.get("trade_status"),
+                "reason_code": trade_data.get("reason_code"),
                 "strategy_details": trade_data.get("strategy_details"),
             })
             _notify_embed_safe(embed, key=f"recorder_insert_{s}_{trade_data.get('ticker','')}", cooldown_sec=60)
         except Exception:
-            # create_trade_embed 미존재 또는 실패 → 텍스트로 최소 알림(쿨다운)
+            # 템플릿 실패 → 텍스트로 최소 알림(쿨다운)
             _notify(
-                f"📝 거래 기록: {s} {name} x{qty} @ {trade_data.get('price')}",
+                f" 거래 기록: {s} {name} x{qty} @ {trade_data.get('price')}",
                 key=f"recorder_insert_text_{trade_data.get('ticker','')}",
                 cooldown_sec=60
             )
 
     except Exception as e:
         logger.error(f"DB 거래 기록 실패: {e}", exc_info=True)
-        _notify(f"🧨 DB 거래 기록 실패: {str(e)[:900]}", key="recorder_record_fail", cooldown_sec=300)
+        _notify(f" DB 거래 기록 실패: {str(e)[:900]}", key="recorder_record_fail", cooldown_sec=300)
 
 def fetch_active_trades(db_path: Optional[str] = None) -> List[Dict]:
     """trade_status='active' 인 거래 반환"""
@@ -264,12 +270,11 @@ def fetch_active_trades(db_path: Optional[str] = None) -> List[Dict]:
                     try:
                         trade["strategy_details"] = json.loads(trade["strategy_details"])
                     except Exception:
-                        # 파싱 실패 시 원문 유지
                         pass
                 active_trades.append(trade)
     except Exception as e:
         logger.error(f"Active 거래 조회 실패: {e}")
-        _notify(f"🧨 Active 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_active_fail", cooldown_sec=300)
+        _notify(f" Active 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_active_fail", cooldown_sec=300)
     return active_trades
 
 def update_trade_status(
@@ -287,13 +292,12 @@ def update_trade_status(
             conn.commit()
         logger.info(f"거래 ID {trade_id} → 상태 '{new_status}' 업데이트")
 
-        # 간단 알림(상태 변경 중요 이벤트)
-        _notify(f"🔄 거래 상태 변경: id={trade_id}, status={new_status}",
+        _notify(f" 거래 상태 변경: id={trade_id}, status={new_status}",
                 key=f"recorder_status_{trade_id}_{new_status}", cooldown_sec=120)
 
     except Exception as e:
         logger.error(f"거래 상태 업데이트 실패 (ID={trade_id}): {e}")
-        _notify(f"🧨 거래 상태 업데이트 실패 (ID={trade_id}): {str(e)[:900]}",
+        _notify(f" 거래 상태 업데이트 실패 (ID={trade_id}): {str(e)[:900]}",
                 key="recorder_update_status_fail", cooldown_sec=300)
 
 def fetch_trades_by_tickers(
@@ -320,7 +324,7 @@ def fetch_trades_by_tickers(
                 trades_map[row["ticker"]] = dict(row)
     except Exception as e:
         logger.error(f"티커별 거래 조회 실패: {e}")
-        _notify(f"🧨 티커별 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_tickers_fail", cooldown_sec=300)
+        _notify(f" 티커별 거래 조회 실패: {str(e)[:900]}", key="recorder_fetch_tickers_fail", cooldown_sec=300)
 
     return trades_map
 
@@ -343,8 +347,11 @@ if __name__ == '__main__':
             "Overall Score": 0.85,
             "FinScore": 0.7,
             "TechScore": 0.9,
-            "NewsSentiment": "positive"
-        }
+            "NewsSentiment": "positive",
+            "stock_info": {"Score": 0.82}
+        },
+        "reason_code": None,
+        "levels_source": None,
     }
 
     sample_sell_trade = {
@@ -353,12 +360,14 @@ if __name__ == '__main__':
         "name": "SK하이닉스",
         "qty": 5,
         "price": 150000,
-        "pnl_amount": 50000,  # 5만원 수익
-        "parent_trade_id": 1,  # 매수 거래 ID
+        "pnl_amount": 50000,               # 5만원 수익
+        "parent_trade_id": 1,              # 매수 거래 ID
         "strategy_name": "RsiReversalStrategy",
         "trade_status": "completed",
         "strategy_details": {"RSI": 75, "reason": "RSI 과매수 구간 진입"},
-        "sell_reason": "RSI 과매수 구간 진입"
+        "sell_reason": "RSI 과매수 구간 진입",
+        "reason_code": "RSI_OVERBOUGHT",
+        "levels_source": "atr_swing",
     }
 
     # 1. 매수 기록 테스트

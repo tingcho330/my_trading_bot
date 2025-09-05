@@ -41,15 +41,38 @@ else:
 # ── 간단 쿨다운(스팸 방지) ──
 _last_sent: Dict[str, float] = {}
 def _notify(content: str, key: str, cooldown_sec: int = 120):
+    """
+    경량 텍스트 알림(최소화). 실패는 무시한다.
+    """
     try:
         now = time.time()
         if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
             _last_sent[key] = now
             if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+                # content-only 전송 (임베드는 별도 함수 사용)
                 send_discord_message(content=content)
     except Exception:
-        # 알림 실패가 전체 파이프라인을 막지 않도록 무시
         pass
+
+def _notify_embed(title: str, description: str, fields: Optional[List[Dict[str, Any]]] = None):
+    """
+    최종 한 번만 쓰는 임베드 알림(스케줄러 요약과 중복 최소화).
+    notifier의 send_discord_message는 content 없이 embeds만으로도 전송 가능(옵셔널).
+    """
+    if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
+        return
+    try:
+        embed = {
+            "title": title,
+            "description": description,
+            "type": "rich",
+        }
+        if fields:
+            embed["fields"] = fields
+        # ✅ 안전 호출: content=""를 명시해 구버전 시그니처도 호환
+        send_discord_message(content="", embeds=[embed])
+    except Exception as e:
+        logger.warning("알림(임베드) 전송 실패: %s", e)
 
 # ────────────── .env 로딩 ──────────────
 def _load_env() -> None:
@@ -82,6 +105,7 @@ _load_env()
 
 # ────────────── 외부 의존(리포 내부) ──────────────
 try:
+    # 프로젝트 구조에 따라 상대/절대 임포트가 다를 수 있어 try/except
     from src.screener import get_market_trend
 except Exception:
     def get_market_trend(date_str: str) -> str:
@@ -177,14 +201,67 @@ def _read_json(p: Path) -> Any:
         return json.load(f)
 
 def _detect_files(fixed_date: str, market: str):
-    screener_file = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
-    news_file     = OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
-    return screener_file, news_file
+    """
+    screener.py 저장 규칙과 정합성:
+      - 선호: screener_candidates_{date}_{market}.json (슬림)
+      - 폴백: screener_candidates_full_... → screener_rank_... → screener_rank_full_...
+    """
+    preferred = OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json"
+    if preferred.exists():
+        return preferred, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+
+    fallbacks = [
+        OUTPUT_DIR / f"screener_candidates_full_{fixed_date}_{market}.json",
+        OUTPUT_DIR / f"screener_rank_{fixed_date}_{market}.json",
+        OUTPUT_DIR / f"screener_rank_full_{fixed_date}_{market}.json",
+    ]
+    for fb in fallbacks:
+        if fb.exists():
+            return fb, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+
+    # 최후: 과거 방식(호환)
+    legacy = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
+    return legacy, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+
+def _detect_latest_screener_file() -> Optional[Path]:
+    """
+    최신 스크리너 결과 파일 자동 탐색 (선호도 순)
+    """
+    patterns = [
+        "screener_candidates_*.json",
+        "screener_candidates_full_*.json",
+        "screener_rank_*.json",
+        "screener_rank_full_*.json",
+        # 과거 파일명 호환
+        "screener_results_*_*.json",
+    ]
+    for pat in patterns:
+        p = find_latest_file(pat)
+        if p:
+            return p
+    return None
+
+def _to_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
+    """
+    공통 스키마로 정규화:
+    - 필수 지표: ATR/RSI/MA50/MA200
+    - 섹터: Sector, SectorSource
+    - 레벨: stop_price/target_price/levels_source (한글 키가 있으면 매핑: 손절가/목표가/source)
+    - 부가: daily_chart(OHLCV records), investor_flow(기관합계/외국인합계)
+    """
     out = []
     for c in cands:
         item = dict(c)
+
+        # Ticker/Name
         if not item.get("Ticker"):
             if item.get("Code"):
                 item["Ticker"] = str(item["Code"]).zfill(6)
@@ -194,6 +271,7 @@ def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
                     item["Name"] = str(c[k])
                     break
 
+        # 숫자 스코어류
         def _f(key, default=0.0):
             try:
                 return float(item.get(key, default))
@@ -206,13 +284,39 @@ def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
         item["MktScore"]     = _f("MktScore")
         item["SectorScore"]  = _f("SectorScore")
         item["PatternScore"] = _f("PatternScore")
-        item["RSI"]          = _f("RSI")
         item["Price"]        = _f("Price", 0.0)
-        item["PER"]          = _f("PER", 0.0) if item.get("PER") is not None else None
-        item["PBR"]          = _f("PBR", 0.0) if item.get("PBR") is not None else None
+        item["RSI"]          = _f("RSI", 50.0)
+        item["ATR"]          = _to_float(item.get("ATR"), None)
+        item["MA50"]         = _f("MA50", 0.0)
+        item["MA200"]        = _f("MA200", 0.0)
 
+        # 재무
+        item["PER"]          = _to_float(item.get("PER"), None) if item.get("PER") is not None else None
+        item["PBR"]          = _to_float(item.get("PBR"), None) if item.get("PBR") is not None else None
+
+        # 패턴 Booleans
         for b in ["MA20Up","AccumVol","HigherLows","Consolidation","YEY"]:
             item[b] = bool(item.get(b, False))
+
+        # 섹터/소스
+        if item.get("Sector") is None and c.get("Industry"):
+            item["Sector"] = c.get("Industry")
+        item["Sector"] = item.get("Sector", "N/A")
+        item["SectorSource"] = item.get("SectorSource", None)
+
+        # 레벨: 다양한 키를 수용
+        stop_price = item.get("stop_price", item.get("손절가"))
+        target_price = item.get("target_price", item.get("목표가"))
+        levels_source = item.get("levels_source", item.get("source"))
+        item["stop_price"] = int(round(float(stop_price))) if stop_price is not None else None
+        item["target_price"] = int(round(float(target_price))) if target_price is not None else None
+        item["levels_source"] = levels_source if levels_source is not None else None
+
+        # 부가 heavy 필드 그대로 패스
+        if "daily_chart" in c:
+            item["daily_chart"] = c["daily_chart"]
+        if "investor_flow" in c:
+            item["investor_flow"] = c["investor_flow"]
 
         out.append(item)
     return out
@@ -254,7 +358,7 @@ def _call_openai_json(system_prompt: str, user_prompt: str) -> Optional[dict]:
 
 def _pretty_print_plans(plans: List[Dict]) -> None:
     if not plans:
-        print("\n--- 🙅 생성된 매수 계획 없음 ---")
+        print("\n--- 매수 계획 없음 ---")
         return
     print("\n=== ✨ 생성된 매수 계획 ===")
     for i, plan in enumerate(plans, 1):
@@ -262,12 +366,15 @@ def _pretty_print_plans(plans: List[Dict]) -> None:
         name = stock.get("Name", "N/A"); ticker = stock.get("Ticker", "N/A")
         strategy = plan.get("전략_클래스", "N/A"); tactic = plan.get("매매전술", "N/A")
         decision = plan.get("결정", "N/A"); reason = (plan.get("분석", "") or "")[:300]
-        stop_px = stock.get("손절가"); tgt_px = stock.get("목표가"); source = stock.get("source")
+        stop_px = stock.get("stop_price"); tgt_px = stock.get("target_price"); source = stock.get("levels_source")
         print(f"\n[{i}] {name} ({ticker}) - {decision}")
         print(f" - 전략: {strategy}")
         print(f" - 전술: {tactic}")
         if stop_px and tgt_px and decision == "매수":
-            print(f" - 손절/목표: {int(round(stop_px)):,} / {int(round(tgt_px)):,}  (source={source})")
+            try:
+                print(f" - 손절/목표: {int(round(float(stop_px))):,} / {int(round(float(tgt_px))):,}  (source={source})")
+            except Exception:
+                print(f" - 손절/목표: {stop_px} / {tgt_px}  (source={source})")
         print(f" - 근거: {reason}...")
 
 def _apply_strategy_weights(selected: str, c: Dict, market_trend: str, weights: Dict[str, float]) -> str:
@@ -324,7 +431,7 @@ def _tactical_plan_gpt(market_trend: str, c: Dict, news_text: str) -> Optional[d
         has_higher_lows=bool(c.get("HigherLows", False)),
         is_consolidating=bool(c.get("Consolidation", False)),
         has_yey_pattern=bool(c.get("YEY", False)),
-        news_text=news_text[:1500],
+        news_text= (news_text or "")[:1500],
     )
     sys = "You are a Chief Investment Strategist. Output must be a single JSON object ONLY."
     return _call_openai_json(sys, user)
@@ -337,9 +444,30 @@ def _heuristic_plan(c: Dict, news_text: str, market_trend: str) -> Dict:
     reason = f"휴리스틱: Score={score:.3f}, 시장={market_trend}, 뉴스길이={len(news_text)}"
     return {"결정": decision, "분석": reason, "전략_클래스": base_strategy, "매매전술": tactic, "parameters": {"installments": []}}
 
+def _compose_reason_suffix(c: Dict) -> str:
+    """
+    levels_source·섹터·지표 요약을 한 줄로 생성하여 GPT/휴리스틱 결과 '분석' 뒤에 붙인다.
+    """
+    sec = c.get("Sector", "N/A")
+    sec_src = c.get("SectorSource", "N/A")
+    rsi = c.get("RSI", None)
+    psc = c.get("PatternScore", None)
+    m20 = "▲" if c.get("MA20Up") else "─"
+    lv_src = c.get("levels_source", "N/A")
+    sp = c.get("stop_price", None)
+    tp = c.get("target_price", None)
+    parts = [
+        f"섹터={sec}({sec_src})",
+        f"RSI={rsi:.2f}" if isinstance(rsi, (int, float)) else "RSI=N/A",
+        f"PatternScore={psc:.2f}" if isinstance(psc, (int, float)) else "PatternScore=N/A",
+        f"MA20={m20}",
+        f"레벨={lv_src}" + (f" [SL:{sp:,}/TP:{tp:,}]" if (isinstance(sp,(int,float)) and isinstance(tp,(int,float))) else ""),
+    ]
+    return " | " + " / ".join(parts)
+
 def analyze_candidates_and_create_plans(
     candidates: List[Dict],
-    news_cache: Dict[str, str],
+    news_cache: Dict[str, Any],
     market_trend: str,
     available_slots: int = 3,
 ) -> List[Dict]:
@@ -354,31 +482,110 @@ def analyze_candidates_and_create_plans(
         name = c.get("Name", "N/A")
         ticker = str(c.get("Ticker", "N/A"))
         score = float(c.get("Score", 0.0))
-        news = (news_cache.get(ticker, "") or "")[:1500]
 
+        # ── 뉴스 상태/본문 처리 (dict 또는 str 호환) ──
+        raw_news = news_cache.get(ticker, "")
+        news_status = None
+        news_text = ""
+        if isinstance(raw_news, dict):
+            news_status = raw_news.get("status")
+            news_text = (raw_news.get("text") or "")[:1500]
+        else:
+            news_text = (raw_news or "")[:1500]
+
+        # ── 초기 필터: 뉴스 없음이면 보수적 ──
         passed = True
+        if news_status == "NO_NEWS":
+            if score < 0.65:
+                passed = False
+            logger.info(f"[Initial] {name}({ticker}) → NO_NEWS 플래그 감지(Score={score:.3f})")
+
+        # ── OpenAI 경로도 동일하게 news_text 사용 ──
         if _OPENAI_AVAILABLE:
-            js = _initial_filter_gpt(name=name, score=score, news_text=news)
+            js = _initial_filter_gpt(name=name, score=score, news_text=news_text)
+            # js 결과와 passed를 함께 고려
             if js and isinstance(js, dict) and js.get("decision") and "보류" in js["decision"]:
                 passed = False
-            logger.info(f"[Initial] {name}({ticker}) → {js.get('decision') if js else '실패'}")
-        elif score < 0.6 and len(news) < 200:
-            passed = False
+            logger.info(f"[Initial] {name}({ticker}) → {js.get('decision') if js else '실패'} (passed={passed})")
+        else:
+            # 휴리스틱: 점수 낮고 뉴스 텍스트 짧으면 보류
+            if score < 0.6 and len(news_text) < 200:
+                passed = False
 
         if not passed:
             continue
 
-        plan_js = _tactical_plan_gpt(market_trend=market_trend, c=c, news_text=news) if _OPENAI_AVAILABLE else _heuristic_plan(c, news, market_trend)
+        # ── 세부 전술/플랜 생성 ──
+        plan_js = (
+            _tactical_plan_gpt(market_trend=market_trend, c=c, news_text=news_text)
+            if _OPENAI_AVAILABLE else
+            _heuristic_plan(c, news_text, market_trend)
+        )
         if not (plan_js and isinstance(plan_js, dict) and plan_js.get("결정")):
-            plan_js = _heuristic_plan(c, news, market_trend)
+            plan_js = _heuristic_plan(c, news_text, market_trend)
 
+        # 전략 가중치로 재선정
         sel = plan_js.get("전략_클래스", "BaseStrategy")
         best = _apply_strategy_weights(selected=sel, c=c, market_trend=market_trend, weights=_strategy_weights)
         if best != sel:
             plan_js["전략_클래스"] = best
 
-        stock_info = {k: v for k, v in c.items()}
-        merged = {"rank": len(results) + 1, "stock_info": stock_info, **plan_js}
+        # ── plan_js 분석 필드에 뉴스태그/레벨소스/섹터/지표 요약 추가 ──
+        stock_info = {k: v for k, v in c.items()}  # 원본 정규화값 전체 포함
+        src = stock_info.get("source") or stock_info.get("levels_source")
+        sector = stock_info.get("Sector")
+        rsi = stock_info.get("RSI"); ma50 = stock_info.get("MA50"); ma200 = stock_info.get("MA200")
+        news_tag = "(NO_NEWS)" if news_status == "NO_NEWS" else "(NEWS_OK)"
+        extra = f" [{news_tag} | levels_source={src} | sector={sector} | RSI={rsi}, MA50={ma50}, MA200={ma200}]"
+
+        if "분석" in plan_js and isinstance(plan_js["분석"], str):
+            plan_js["분석"] = (plan_js["분석"] or "") + extra
+        else:
+            plan_js["분석"] = extra
+
+        # 기존 공통 사후 요약도 덧붙임(선택)
+        plan_js["분석"] += _compose_reason_suffix(c)
+
+        # stock_info: 공통 스키마로 전달(필요 필드 중심)
+        stock_info_min = {
+            # 식별
+            "Ticker": c.get("Ticker"),
+            "Name": c.get("Name"),
+            # 가격/지표
+            "Price": c.get("Price"),
+            "ATR": c.get("ATR"),
+            "RSI": c.get("RSI"),
+            "MA50": c.get("MA50"),
+            "MA200": c.get("MA200"),
+            # 스코어
+            "Score": c.get("Score"),
+            "FinScore": c.get("FinScore"),
+            "TechScore": c.get("TechScore"),
+            "MktScore": c.get("MktScore"),
+            "SectorScore": c.get("SectorScore"),
+            "PatternScore": c.get("PatternScore"),
+            # 패턴 플래그
+            "MA20Up": c.get("MA20Up"),
+            "AccumVol": c.get("AccumVol"),
+            "HigherLows": c.get("HigherLows"),
+            "Consolidation": c.get("Consolidation"),
+            "YEY": c.get("YEY"),
+            # 재무
+            "PER": c.get("PER"),
+            "PBR": c.get("PBR"),
+            # 섹터
+            "Sector": c.get("Sector"),
+            "SectorSource": c.get("SectorSource"),
+            # 레벨(공통)
+            "stop_price": c.get("stop_price"),
+            "target_price": c.get("target_price"),
+            "levels_source": c.get("levels_source"),
+            # 부가 heavy
+            "daily_chart": c.get("daily_chart"),
+            "investor_flow": c.get("investor_flow"),
+        }
+
+        merged = {"rank": len(results) + 1, "stock_info": stock_info_min, **plan_js}
         results.append(merged)
 
     return results
@@ -388,20 +595,23 @@ def run_pipeline(
     market: str = "KOSPI",
     available_slots: int = 3
 ) -> Optional[Path]:
-    start_msg = f"🧠 GPT 분석 시작 (date={fixed_date or 'auto'}, market={market}, slots={available_slots})"
+    start_msg = f"▶ GPT 분석 시작 (date={fixed_date or 'auto'}, market={market}, slots={available_slots})"
     logger.info(start_msg)
-    _notify(start_msg, key="gpt_analyzer_start", cooldown_sec=60)
+    # 시작 알림은 로그만 남기고 외부 알림은 생략(중복 제거)
+    # _notify(start_msg, key="gpt_analyzer_start", cooldown_sec=60)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 날짜/마켓 자동 결정: screener 저장 규칙에 맞춰 탐색
     if not fixed_date:
-        latest = find_latest_file("screener_results_*_*.json")
+        latest = _detect_latest_screener_file()
         if not latest:
-            msg = "screener_results_*.json 파일을 찾지 못했습니다."
+            msg = "스크리너 결과 파일을 찾지 못했습니다. (candidates/rank 패턴 모두 실패)"
             logger.error(msg)
             _notify(f"❌ {msg}", key="gpt_analyzer_missing_screener", cooldown_sec=120)
             return None
         parts = latest.stem.split("_")
+        # candidates(_full)_YYYYMMDD_MARKET or rank(_full)_YYYYMMDD_MARKET
         fixed_date, market = (parts[-2], parts[-1]) if len(parts) >= 4 else (None, market)
         if not fixed_date:
             msg = f"파일명에서 날짜/시장 추출 실패: {latest.name}"
@@ -422,8 +632,9 @@ def run_pipeline(
         return None
 
     logger.info(f"로드: {screener_file.name}, {news_file.name}")
-    candidates: List[Dict] = _normalize_candidates(_read_json(screener_file))
-    news_cache: Dict[str, str] = _read_json(news_file)
+    candidates_raw: List[Dict] = _read_json(screener_file)
+    candidates: List[Dict] = _normalize_candidates(candidates_raw)
+    news_cache: Dict[str, Any] = _read_json(news_file)
     market_trend = get_market_trend(fixed_date)
     logger.info(f"시장 추세: {market_trend}")
 
@@ -435,19 +646,27 @@ def run_pipeline(
         json.dump(plans or [], f, ensure_ascii=False, indent=2)
     logger.info(f"저장 완료 → {out_path}")
 
-    # 결과 요약 노티(상위 3개만)
+    # 최종 요약 알림(임베드 1회) — 스케줄러 요약과 중복되지 않도록 최소화
     try:
         if plans:
             top = plans[:min(3, len(plans))]
-            lines = [f"✅ GPT 분석 완료: {len(plans)}건 생성 (date={fixed_date}, {market})", "Top:"]
-            for p in top:
-                s = p.get("stock_info", {})
-                lines.append(f"- {s.get('Name','N/A')}({str(s.get('Ticker','N/A')).zfill(6)}): {p.get('결정')} / {p.get('전략_클래스')}")
-            _notify("\n".join(lines), key="gpt_analyzer_done", cooldown_sec=60)
+            fields = []
+            for i, p in enumerate(top, 1):
+                s = p.get('stock_info', {})
+                fields.append({
+                    "name": f"[{i}] {s.get('Name','N/A')} ({str(s.get('Ticker','N/A')).zfill(6)})",
+                    "value": f"{p.get('결정')} / {p.get('전략_클래스')} / SL:{s.get('stop_price')} TP:{s.get('target_price')} ({s.get('levels_source')})",
+                    "inline": False
+                })
+            _notify_embed(
+                title=f"✅ GPT 분석 완료: {len(plans)}건 생성",
+                description=f"date={fixed_date}, market={market}",
+                fields=fields
+            )
         else:
             _notify(f"ℹ️ GPT 분석 완료: 생성된 계획 없음 (date={fixed_date}, {market})", key="gpt_analyzer_done_empty", cooldown_sec=60)
-    except Exception:
-        _notify(f"✅ GPT 분석 완료 (요약 구성 실패) (date={fixed_date}, {market})", key="gpt_analyzer_done", cooldown_sec=60)
+    except Exception as e:
+        logger.warning("최종 요약 알림 실패: %s", e)
 
     return out_path
 

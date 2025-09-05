@@ -26,7 +26,11 @@ from utils import (
     cache_save,
     find_latest_file,
     is_market_open_day,
+    KST,  # ← generated_at용
 )
+
+# ---- 스키마 메타 ----
+SCHEMA_VERSION = "1.1"
 
 # ---- load_config 폴백 ----
 def _load_config_fallback() -> dict:
@@ -56,6 +60,7 @@ from screener_core import (
     _compute_levels,          # 손절/목표가 계산 (ATR/스윙 기반, 퍼센트 백업)
     get_historical_prices,    # 과거 시세 조회 (pykrx 우선, fdr 백업)
     calculate_rsi,            # RSI 계산
+    calculate_atr,            # ATR 계산
 )
 
 # ───────────────── 기본 설정/로깅 ─────────────────
@@ -555,6 +560,57 @@ def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float
     except Exception:
         return {"above_ma50": 0.5, "ma50_gt_ma200": 0.5, "rsi_term": 0.5}
 
+# ─────────── 투자자별 수급 데이터 조회 (신규 추가) ───────────
+def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Optional[pd.DataFrame]:
+    """지정된 기간 동안의 투자자별 거래대금(기관, 외국인 등)을 조회합니다."""
+    try:
+        end_date = datetime.strptime(date_str, "%Y%m%d")
+        start_date = (end_date - timedelta(days=days_lookback * 2)).strftime("%Y%m%d")  # 주말 포함 여유
+        df_flow = pykrx.get_market_trading_value_by_date(start_date, date_str, ticker)
+
+        if df_flow is not None and not df_flow.empty:
+            # pykrx 버전에 따라 대금/순매수 명칭이 다를 수 있어 통일
+            df_flow = df_flow.rename(columns={
+                '기관합계대금': '기관합계',
+                '외국인합계대금': '외국인합계',
+            })
+            required = ['기관합계', '외국인합계']
+            if all(col in df_flow.columns for col in required):
+                return df_flow[required].tail(days_lookback)
+    except Exception as e:
+        logger.debug("[%s] 투자자별 수급 조회 실패: %s", ticker, e)
+    return None
+
+# ─────────── FDR Marcap 비정상 시 PYKRX 시총 폴백 ───────────
+def _get_marcap_series_from_pykrx(date_str: str, market: str) -> pd.Series:
+    """
+    PYKRX에서 해당 날짜의 시가총액을 받아 Series('Marcap')로 반환.
+    FDR의 Marcap이 전부 0이거나 누락된 경우 사용.
+    """
+    try:
+        df_mc = pykrx.get_market_cap_by_ticker(date_str, market=market)
+        if df_mc is None or df_mc.empty:
+            return pd.Series(dtype="float64", name="Marcap")
+        df_mc = _norm_code_index(df_mc)
+        col = None
+        for c in ["시가총액", "시가총액 (백만)", "시가총액(백만)"]:
+            if c in df_mc.columns:
+                col = c
+                break
+        if col is None:
+            numeric_cols = [c for c in df_mc.columns if pd.api.types.is_numeric_dtype(df_mc[c])]
+            if not numeric_cols:
+                return pd.Series(dtype="float64", name="Marcap")
+            col = numeric_cols[0]
+        s = pd.to_numeric(df_mc[col], errors="coerce").fillna(0)
+        # 단위가 '백만'이면 원화 환산
+        if "백만" in col:
+            s = s * 1_000_000
+        return s.rename("Marcap")
+    except Exception as e:
+        logger.debug("PYKRX 시가총액 폴백 실패: %s", e)
+        return pd.Series(dtype="float64", name="Marcap")
+
 def _filter_initial_stocks(
     date_str: str,
     cfg: Dict[str, Any],
@@ -564,7 +620,28 @@ def _filter_initial_stocks(
 ) -> Tuple[pd.DataFrame, str]:
     logger.info("1차 필터링 시작...")
     fixed_date = _resolve_business_date(date_str, market)
+
+    # 종목 기본 목록(FDR)
     df_all = get_stock_listing(market)
+
+    # --- FDR Marcap 검증 & PYKRX 폴백 ---
+    marcap_fdr = pd.to_numeric(df_all.get("Marcap", pd.Series(dtype="float64")), errors="coerce").fillna(0)
+    need_fallback = ("Marcap" not in df_all.columns) or (marcap_fdr.sum() == 0)
+    if need_fallback:
+        logger.warning("FDR Marcap 비정상 감지 → PYKRX 시가총액으로 폴백합니다. (date=%s, market=%s)", fixed_date, market)
+        mc_pykrx = _get_marcap_series_from_pykrx(fixed_date, market)
+        if not mc_pykrx.empty:
+            # 충돌 방지: 기존 Marcap 제거 후 조인
+            if "Marcap" in df_all.columns:
+                df_all = df_all.drop(columns=["Marcap"], errors="ignore")
+            df_all = df_all.join(mc_pykrx, how="left")
+            mapped = int(mc_pykrx.notna().sum())
+            logger.info("PYKRX 시총 매핑 완료: %d개 종목", mapped)
+        else:
+            logger.error("PYKRX 시가총액 폴백도 실패 → Marcap=0으로 진행(전량 탈락 가능).")
+            df_all["Marcap"] = 0
+
+    # 펀더멘털
     fundamentals = get_fundamentals(fixed_date, market)
     if fundamentals is None or fundamentals.empty:
         alt_date = (datetime.strptime(fixed_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
@@ -576,7 +653,10 @@ def _filter_initial_stocks(
         else:
             fixed_date = alt_date
 
+    # 거래대금 5일 평균
     amt5 = _get_trading_value_5d_avg(fixed_date, market)
+
+    # 조인
     df_pre = (
         df_all[["Name", "Marcap"]]
         .join(amt5, how="left")
@@ -591,6 +671,7 @@ def _filter_initial_stocks(
     _describe_series("Marcap", df_pre["Marcap"])
     _describe_series("Amount5D", df_pre["Amount5D"])
 
+    # 필터링
     min_mc = float(cfg.get("min_market_cap", 0))
     min_amt = float(cfg.get("min_trading_value_5d_avg", 0))
     mask_mc = df_pre["Marcap"] >= min_mc
@@ -611,6 +692,7 @@ def _filter_initial_stocks(
 
     df_filtered = df_pre[mask_mc & mask_amt].copy()
 
+    # 화이트/블랙리스트
     bl = {str(x).zfill(6) for x in risk.get("blacklist_tickers", []) if x}
     wl = {str(x).zfill(6) for x in risk.get("whitelist_tickers", []) if x}
     if wl:
@@ -635,6 +717,7 @@ def _calculate_scores_for_ticker(
     cfg: Dict[str, Any],
     market_score: float,
     sector_trends: Dict[str, float],
+    risk_params: Dict[str, Any],  # ← 추가: ATR 기간은 risk_params에서 읽음
 ) -> Optional[Dict[str, Any]]:
     try:
         start_dt_str = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
@@ -646,8 +729,16 @@ def _calculate_scores_for_ticker(
         ma50 = df_price["Close"].rolling(50).mean().iloc[-1]
         ma200 = df_price["Close"].rolling(200).mean().iloc[-1]
         rsi = calculate_rsi(df_price["Close"])
+
+        # --- ATR 계산: risk_params에서 기간 사용 ---
+        atr_period = int((risk_params or {}).get("atr_period", 14))
+        atr_val = calculate_atr(df_price, period=atr_period)
+
         if any(pd.isna(x) for x in [ma50, ma200, rsi]):
             return None
+
+        # --- 투자자별 수급 데이터 조회 추가 ---
+        df_investor_flow = get_investor_flow(code, date_str)
 
         tech_score = (
             (1 if close > ma50 else 0)
@@ -661,7 +752,7 @@ def _calculate_scores_for_ticker(
         pbr_term = max(0, min(1, (5 - pbr_val) / 5)) if pd.notna(pbr_val) and pbr_val > 0 else 0
         fin_score = 0.5 * (per_term + pbr_term)
 
-        sector_name = str(fin_info.get("Sector", "N/A"))
+        sector_name = str(fin_info.get("Sector", "N/A")) if "Sector" in fin_info else "N/A"
         sector_score = float(sector_trends.get(sector_name, 0.5))
 
         ma20_up = analyze_ma20_trend(df_price)
@@ -686,8 +777,16 @@ def _calculate_scores_for_ticker(
         )
         total_score = float(np.clip(total_score, 0.0, 1.0))
 
+        # 보강: 이름/섹터소스도 함께 싣는다(후속 단계에서 중복제거 후 df_scores 기준으로 사용)
+        name_val = fin_info.get("Name", "")
+        sector_src = fin_info.get("SectorSource", "unknown")
+
+        # JSON 직렬화를 위해 records 형태로 변환
         return {
             "Ticker": code,
+            "Name": str(name_val) if pd.notna(name_val) else "",
+            "Sector": sector_name,
+            "SectorSource": str(sector_src) if pd.notna(sector_src) else "unknown",
             "Price": int(round(float(close))),
             "Score": round(float(total_score), 4),
             "FinScore": round(float(fin_score), 4),
@@ -703,8 +802,11 @@ def _calculate_scores_for_ticker(
             "PER": round(float(per_val), 2) if pd.notna(per_val) else None,
             "PBR": round(float(pbr_val), 2) if pd.notna(pbr_val) else None,
             "RSI": round(float(rsi), 2),
+            "ATR": round(float(atr_val), 2) if atr_val is not None else None,
             "MA50": round(float(ma50), 2),
             "MA200": round(float(ma200), 2),
+            "daily_chart": df_price.reset_index().to_dict('records') if df_price is not None else None,
+            "investor_flow": df_investor_flow.reset_index().to_dict('records') if df_investor_flow is not None else None,
         }
     except Exception as ex:
         logger.debug("[%s] 스코어 계산 예외: %s", code, ex)
@@ -831,6 +933,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     screener_params,
                     market_score,
                     sector_trends,
+                    risk_params,  # ← ATR 기간 전달
                 ): code
                 for code, row in df_filtered.iterrows()
             }
@@ -848,19 +951,31 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize"):
         df_scores = pd.DataFrame(results).set_index("Ticker")
-        df_scores = df_scores.drop(columns=["Sector"], errors="ignore")
 
-        df_filtered_no_dup = df_filtered.drop(columns=["PER", "PBR"], errors="ignore")
+        # ⚠️ 좌/우 데이터프레임 컬럼 충돌 방지:
+        # - df_scores에는 ['Name','Sector','SectorSource','Price', ...]가 포함됨
+        # - df_filtered 측의 겹치는 컬럼을 동적으로 제거하여 안전하게 join
+        left = df_filtered.copy()
+        right = df_scores.copy()
+        overlapping = set(left.columns).intersection(set(right.columns))
+        if overlapping:
+            logger.debug("join 전 중복 컬럼 제거: %s", sorted(overlapping))
+            left = left.drop(columns=list(overlapping), errors="ignore")
+
+        # 조인 실행(인덱스=티커)
         df_final = (
-            df_filtered_no_dup.join(df_scores, how="inner")
+            left.join(right, how="inner")
             .reset_index()
             .rename(columns={"index": "Ticker"})
         )
+
+        # 전체 정렬(무거운 컬럼 포함 상태)
         df_sorted = df_final.sort_values("Score", ascending=False)
 
         top_n = min(int(screener_params.get("top_n", 10)), int(risk_params.get("max_positions", 10)))
         sector_cap = float(screener_params.get("sector_cap", 0.3))
 
+        # 다양화
         final_candidates = diversify_by_sector(df_sorted.set_index("Ticker"), top_n, sector_cap).reset_index()
 
         # 손절/목표가 계산 (core)
@@ -871,37 +986,79 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         df_levels = pd.DataFrame(levels_data, index=final_candidates.index)
         final_candidates = pd.concat([final_candidates, df_levels], axis=1)
 
+        # 공통 스키마 alias 추가: stop/target/levels_source
+        if "손절가" in final_candidates.columns:
+            final_candidates["stop_price"] = final_candidates["손절가"]
+        if "목표가" in final_candidates.columns:
+            final_candidates["target_price"] = final_candidates["목표가"]
+        if "source" in final_candidates.columns:
+            final_candidates["levels_source"] = final_candidates["source"]
+
+        # 저장할 컬럼 순서 정의 (공통 스키마 항목 포함)
         cols = [
-            "Ticker", "Name", "Sector", "Price", "손절가", "목표가", "source", "MA50", "MA200", "Score",
+            "Ticker", "Name", "Sector", "SectorSource", "Price",
+            "손절가", "목표가", "source", "stop_price", "target_price", "levels_source",
+            "MA50", "MA200", "Score",
             "FinScore", "TechScore", "MktScore", "SectorScore", "PatternScore",
             "MA20Up", "AccumVol", "HigherLows", "Consolidation", "YEY",
-            "PER", "PBR", "RSI", "Marcap", "Amount5D", "SectorSource",
+            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D",
         ]
         keep = [c for c in cols if c in final_candidates.columns]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]
 
-        with pd.option_context("display.width", 240):
-            print("\n--- ⭐ 최종 스크리닝 결과 ⭐ ---")
-            print(final_candidates.to_string(index=False))
+        # 무거운 컬럼 정의
+        drop_cols = ["daily_chart", "investor_flow"]
 
-        # ✅ 경로 결합은 / 사용
-        full_json = OUTPUT_DIR / f"screener_full_{fixed_date}_{market}.json"
-        final_json = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
+        # ── 메타 필드 주입(레코드 레벨) ─────────────────────────
+        generated_at = datetime.now(KST).isoformat()
+        # 랭킹 전체(풀/슬림)
+        df_sorted_full = df_sorted.reset_index(drop=True).copy()
+        df_sorted_full["schema_version"] = SCHEMA_VERSION
+        df_sorted_full["generated_at"] = generated_at
 
-        df_sorted.to_json(full_json, orient="records", indent=2, force_ascii=False)
-        final_candidates.to_json(final_json, orient="records", indent=2, force_ascii=False)
-        logger.info("전체 랭킹 저장: %s", full_json)
-        logger.info("✅ 스크리닝 완료. %d개 후보 저장: %s", len(final_candidates), final_json)
+        df_sorted_slim = df_sorted.drop(columns=drop_cols, errors="ignore").reset_index(drop=True).copy()
+        df_sorted_slim["schema_version"] = SCHEMA_VERSION
+        df_sorted_slim["generated_at"] = generated_at
+
+        # 최종 후보(풀/슬림)
+        final_candidates_full = final_candidates.copy()
+        final_candidates_full["schema_version"] = SCHEMA_VERSION
+        final_candidates_full["generated_at"] = generated_at
+
+        final_candidates_slim = final_candidates.drop(columns=drop_cols, errors="ignore").copy()
+        final_candidates_slim["schema_version"] = SCHEMA_VERSION
+        final_candidates_slim["generated_at"] = generated_at
+        # ─────────────────────────────────────────────────────────
+
+        # 파일 경로
+        rank_full_json   = OUTPUT_DIR / f"screener_rank_full_{fixed_date}_{market}.json"
+        rank_slim_json   = OUTPUT_DIR / f"screener_rank_{fixed_date}_{market}.json"
+        cands_full_json  = OUTPUT_DIR / f"screener_candidates_full_{fixed_date}_{market}.json"
+        cands_slim_json  = OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json"
+
+        # 저장
+        df_sorted_full.to_json(rank_full_json, orient="records", indent=2, force_ascii=False)
+        df_sorted_slim.to_json(rank_slim_json, orient="records", indent=2, force_ascii=False)
+        final_candidates_full.to_json(cands_full_json, orient="records", indent=2, force_ascii=False)
+        final_candidates_slim.to_json(cands_slim_json, orient="records", indent=2, force_ascii=False)
+
+        logger.info("전체 랭킹(풀) 저장: %s", rank_full_json)
+        logger.info("전체 랭킹(슬림) 저장: %s", rank_slim_json)
+        logger.info("최종 후보(풀) 저장: %s", cands_full_json)
+        logger.info("✅ 스크리닝 완료. 후보(슬림) 저장: %s", cands_slim_json)
 
         # 디스코드 요약 알림(상위 5개)
         try:
-            top5 = final_candidates.head(5)[["Ticker", "Name", "Sector", "Price", "목표가", "손절가", "Score"]]
+            top5 = final_candidates_slim.head(5)[["Ticker", "Name", "Sector", "Price", "목표가", "손절가", "Score"]]
             lines = ["Top5:"]
             for _, r in top5.iterrows():
+                px = int(r["Price"]) if pd.notna(r["Price"]) else 0
+                tp = int(r["목표가"]) if pd.notna(r["목표가"]) else 0
+                sl = int(r["손절가"]) if pd.notna(r["손절가"]) else 0
                 lines.append(
-                    f"- {r['Name']}({str(r['Ticker']).zfill(6)}), "
-                    f"Sec:{r['Sector']}, Px:{int(r['Price']):,}, "
-                    f"TP:{int(r['목표가']):,}, SL:{int(r['손절가']):,}, S:{r['Score']:.3f}"
+                    f"- {r.get('Name','')}({str(r['Ticker']).zfill(6)}), "
+                    f"Sec:{r.get('Sector','N/A')}, Px:{px:,}, "
+                    f"TP:{tp:,}, SL:{sl:,}, S:{float(r['Score']):.3f}"
                 )
             _notify("✅ 스크리너 완료\n" + "\n".join(lines), key="screener_done", cooldown_sec=60)
         except Exception:

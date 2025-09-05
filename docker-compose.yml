@@ -1,28 +1,35 @@
-services:
-  # 스케줄에 따라 전체 파이프라인을 실행하는 서비스
-  scheduler:
-    build: .
-    container_name: my_trading_bot_scheduler
-    env_file:
-      - .env
-    volumes:
-      - ./src:/app/src
-      - ./config:/app/config
-      - ./output:/app/output
-    # scheduler.py는 내부에 schedule 라이브러리를 사용해 주기적으로 동작합니다.
-    command: python /app/src/scheduler.py
-    restart: always
+# 이 스택 전체의 프로젝트/리소스 이름 접두사
+name: isa_stack
 
-  # 보유 종목을 실시간으로 모니터링하는 리스크 관리 서비스
-  risk_manager:
-    build: .
-    container_name: my_trading_bot_risk_manager
+x-common: &common
+  build:
+    context: .           # Dockerfile이 isa/ 폴더 안에 있으면 이대로
+    # dockerfile: ../Dockerfile   # 만약 루트에 Dockerfile이 있다면 주석 해제
+  restart: always
+  volumes:
+    - ./src:/app/src
+
+services:
+  # 스케줄에 따라 전체 파이프라인 실행
+  scheduler:
+    <<: *common
+    container_name: isa_my_trading_bot_scheduler
     env_file:
-      - .env
+      - ./config/.env        # isa/config/.env
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config # isa/config -> /app/config
+      - ./output:/app/output # isa/output -> /app/output
+    command: python /app/src/scheduler.py
+
+  # 보유 종목 실시간 모니터링
+  risk_manager:
+    <<: *common
+    container_name: isa_my_trading_bot_risk_manager
+    env_file:
+      - ./config/.env
     volumes:
       - ./src:/app/src
       - ./config:/app/config
       - ./output:/app/output
-    # risk_manager.py는 보유 종목을 계속 모니터링하기 위해 장시간 실행됩니다.
     command: python /app/src/risk_manager.py
-    restart: on-failure

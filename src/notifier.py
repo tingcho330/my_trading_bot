@@ -1,227 +1,224 @@
 # src/notifier.py
 import os
-import requests
+import time
+import re
 import logging
-from typing import Dict, List, Optional
-from dotenv import load_dotenv, find_dotenv
-from pathlib import Path
-from urllib.parse import urlparse
 import threading
+from typing import Optional, List, Dict, Any
 
-# ───────────────── 로깅 설정 ─────────────────
-# 루트 로거에 기본 핸들러 설정 (다른 모듈의 로그도 수집됨)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+import httpx
 
-# 이 모듈 전용 로거 (이 이름을 핸들러에서 루프 방지 키로 사용)
-logger = logging.getLogger("notifier")
+# ────────────────────────────────────────────────────────────────────
+# 기본 설정
+# ────────────────────────────────────────────────────────────────────
+WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-# ───────────────── .env 로딩 (고정 경로 + 폴백) ─────────────────
-def load_env_with_fallback() -> str:
-    """
-    /app/config/.env 우선 → 파일 기준 후보 → CWD 후보 → find_dotenv 순으로 탐색.
-    로드 성공 시 경로 문자열을 반환, 없으면 빈 문자열 반환.
-    """
-    candidates = [
-        Path("/app/config/.env"),                                    # 절대 경로 우선
-        Path(__file__).resolve().parents[1] / "config" / ".env",     # .../src → /config/.env
-        Path(__file__).resolve().parent / "config" / ".env",         # 현재 폴더 하위 config/.env
-        Path(__file__).resolve().parent / ".env",                    # 현재 폴더 .env
-        Path.cwd() / "config" / ".env",                              # CWD/config/.env
-        Path.cwd() / ".env",                                         # CWD/.env
-    ]
+# httpx 타임아웃 (connect/read/write 개별 설정)
+HTTPX_TIMEOUT = httpx.Timeout(10.0, connect=5.0, read=5.0, write=5.0)
 
-    loaded = ""
-    for p in candidates:
-        try:
-            if p.is_file():
-                if load_dotenv(dotenv_path=p, override=False):
-                    loaded = str(p)
-                    break
-        except Exception:
-            continue
+DEFAULT_TIMEOUT = 7.0
+MAX_RETRIES = 2              # 429/일시 오류 재시도 횟수
+BASE_BACKOFF = 0.6           # 지수 백오프 시작(초)
+MIN_INTERVAL = 0.75          # 메시지 최소 간격(초) - 러프한 토큰버킷
 
-    if not loaded:
-        try:
-            found = find_dotenv(usecwd=True)
-            if found:
-                load_dotenv(found, override=False)
-                loaded = found
-        except Exception:
-            pass
+# noisy 로거 셋 (emit에서 필터링)
+_NOISY_LOGGERS = {"httpx", "httpcore", "urllib3"}
 
-    logger.info(f".env loaded from: {loaded if loaded else 'None'}")
-    return loaded
+# emit 재진입 가드용 thread-local
+_emit_local = threading.local()
 
-_ = load_env_with_fallback()
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# 내부 전용 로거(핸들러 재귀 방지 위해 사용 최소화: 기본적으로 찍지 않음)
+_logger = logging.getLogger("notifier")
+_logger.propagate = False  # 상위(root)로 전파 금지
 
-# ───────────────── 유틸: 웹훅 URL 검증 ─────────────────
-def is_valid_webhook(url: str) -> bool:
-    """
-    Discord 웹훅 URL 형식 검증:
-    - 스킴: http/https
-    - 도메인: discord.com 또는 discordapp.com
-    - 경로: /api/webhooks/ 포함
-    """
-    try:
-        if not url:
-            return False
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = (parsed.netloc or "").lower()
-        if not (host.endswith("discord.com") or host.endswith("discordapp.com")):
-            return False
-        if "/api/webhooks/" not in parsed.path:
-            return False
-        return True
-    except Exception:
+# 전역 HTTP 클라이언트
+_client = httpx.Client(timeout=HTTPX_TIMEOUT, headers={"Content-Type": "application/json"})
+
+# 간단 레이트리밋(최소 간격)
+_last_sent_ts = 0.0
+
+# ────────────────────────────────────────────────────────────────────
+# 유틸
+# ────────────────────────────────────────────────────────────────────
+_WEBHOOK_RE = re.compile(r"^https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+$")
+
+def is_valid_webhook(url: Optional[str]) -> bool:
+    # 간결 체크(사용자 제안) + 정규식 강화 체크 병행
+    if not url:
         return False
+    if not url.startswith("https://discord.com/api/webhooks/"):
+        return False
+    return bool(_WEBHOOK_RE.match(url))
 
-# ───────────────── 디스코드 전송 ─────────────────
-def send_discord_message(content: Optional[str] = None, embeds: Optional[List[Dict]] = None, *, _silent: bool = False) -> None:
-    """
-    디스코드로 메시지 전송. notifier 로거를 사용해 루프를 회피하고,
-    잘못된 URL은 경고만 남기고 리턴.
-    _silent=True 이면 실패 로그를 남기지 않음(핸들러 내부용).
-    """
+# ────────────────────────────────────────────────────────────────────
+# 디스코드 전송
+#  - content 없이 embeds만으로도 전송 가능
+#  - 429/일시 오류 백오프 재시도
+#  - 내부에서 logging 호출하지 않아 핸들러 재귀 방지
+# ────────────────────────────────────────────────────────────────────
+def send_discord_message(
+    content: Optional[str] = None,
+    embeds: Optional[List[Dict[str, Any]]] = None,
+    username: Optional[str] = None,
+) -> None:
+    """Discord Webhook 전송. 실패는 조용히 무시(로깅 재귀 방지)."""
+    global _last_sent_ts
     if not is_valid_webhook(WEBHOOK_URL):
-        if not _silent:
-            logger.warning("DISCORD_WEBHOOK_URL이 유효하지 않습니다. (예: https://discord.com/api/webhooks/...)")
         return
 
-    payload: Dict[str, object] = {}
+    # 최소 간격 레이트리밋
+    now = time.time()
+    gap = now - _last_sent_ts
+    if gap < MIN_INTERVAL:
+        try:
+            time.sleep(MIN_INTERVAL - gap)
+        except Exception:
+            # sleep 중 인터럽트 등은 무시
+            pass
+
+    payload: Dict[str, Any] = {}
     if content:
-        # 디스코드 메시지 길이 제한(2000자) 대응
-        payload["content"] = content[:2000]
+        # 디스코드 content 최대 2000자, 여유 있게 1900자로 제한
+        payload["content"] = str(content)[:1900]
     if embeds:
-        payload["embeds"] = embeds
+        # embed 10개 제한 고려(보수적으로 5개)
+        payload["embeds"] = embeds[:5]
+    if username:
+        payload["username"] = username
 
-    try:
-        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        if not _silent:
-            logger.info("디스코드 메시지 전송 성공!")
-    except requests.RequestException as e:
-        if not _silent:
-            # 루트 로거가 아닌 notifier 로거를 사용 -> DiscordLogHandler가 자체적으로 무시
-            logger.error(f"디스코드 메시지 전송 실패: {e}")
+    if not payload.get("content") and not payload.get("embeds"):
+        # 아무 것도 없으면 전송 안 함
+        return
 
-# ───────────────── 임베드 빌더 ─────────────────
-def create_trade_embed(trade_info: Dict) -> Dict:
-    """매매 내역 정보를 받아 디스코드 임베드 형식으로 만듭니다."""
-    side = (trade_info.get('side') or 'N/A').upper()
-    status = (trade_info.get('trade_status') or 'N/A').lower()
+    backoff = BASE_BACKOFF
+    for attempt in range(0, MAX_RETRIES + 1):
+        try:
+            resp = _client.post(WEBHOOK_URL, json=payload)
+            if resp.status_code == 204:
+                _last_sent_ts = time.time()
+                return
+            if resp.status_code == 429:
+                # 디스코드 레이트리밋 헤더 기반 대기
+                retry_after = 0.0
+                try:
+                    # 우선순위: Retry-After(초) → X-RateLimit-Reset-After(초)
+                    retry_after = float(resp.headers.get("Retry-After", "0"))
+                except Exception:
+                    retry_after = 0.0
+                if retry_after <= 0:
+                    retry_after = backoff
+                    backoff *= 2
+                try:
+                    time.sleep(min(10.0, max(0.5, retry_after)))
+                except Exception:
+                    pass
+                continue  # 재시도
+            # 5xx/일시적 장애: 지수 백오프 후 재시도
+            if 500 <= resp.status_code < 600 and attempt < MAX_RETRIES:
+                try:
+                    time.sleep(backoff)
+                except Exception:
+                    pass
+                backoff *= 2
+                continue
+            # 이외 오류는 조용히 중단
+            return
+        except Exception:
+            # 네트워크 예외 등: 지수 백오프 재시도
+            if attempt < MAX_RETRIES:
+                try:
+                    time.sleep(backoff)
+                except Exception:
+                    pass
+                backoff *= 2
+                continue
+            return
 
-    # 주문 상태에 따른 색상 및 제목
-    if status == 'failed':
-        color = 16711680  # 빨강
-        title = f"❌ 주문 실패: {side}"
-    elif side == 'SELL':
-        color = 15105570  # SELL 톤
-        title = f"🔔 주문 실행 알림: {side}"
-    else:
-        color = 3066993   # BUY 톤
-        title = f"🔔 주문 실행 알림: {side}"
+# ────────────────────────────────────────────────────────────────────
+# 로깅 핸들러
+#  - noisy 로거 무시
+#  - emit 내에서 어떤 로거도 호출하지 않음(재귀 방지)
+#  - 재진입 가드(thread-local) 적용
+#  - content-only 간결 메시지 전송
+# ────────────────────────────────────────────────────────────────────
+class DiscordLogHandler(logging.Handler):
+    def __init__(self, webhook_url: Optional[str] = None, level=logging.ERROR):
+        super().__init__(level=level)
+        self.webhook_url = webhook_url or WEBHOOK_URL
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # noisy 로거 무시
+        if record.name in _NOISY_LOGGERS:
+            return
+
+        # 재진입 가드
+        if getattr(_emit_local, "emitting", False):
+            return
+
+        if not is_valid_webhook(self.webhook_url):
+            return
+
+        # 너무 긴 메시지 방어 및 포맷
+        try:
+            msg = self.format(record)
+        except Exception:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = ""
+
+        # 스택트레이스 등은 길어질 수 있으므로 content에만 담고 잘라냄
+        text = msg[:1900] if msg else ""
+
+        # 절대 logging 호출 금지 (여기서 다시 로깅하면 재귀됨)
+        try:
+            _emit_local.emitting = True
+            if text:
+                send_discord_message(content=text)
+        finally:
+            _emit_local.emitting = False
+
+# ────────────────────────────────────────────────────────────────────
+# 주문/체결용 임베드 포맷터
+# ────────────────────────────────────────────────────────────────────
+def create_trade_embed(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    payload keys (예시):
+      side: "BUY"|"SELL"
+      name: "삼성전자"
+      ticker: "005930"
+      qty: 10
+      price: 71200
+      trade_status: "submitted"|"completed"|"failed"|"skipped"
+      strategy_details: { ... 임의 ... }
+    """
+    side = str(payload.get("side", "?")).upper()
+    name = payload.get("name", "N/A")
+    ticker = str(payload.get("ticker", "N/A")).zfill(6)
+    qty = payload.get("qty", 0)
+    price = payload.get("price", 0)
+    trade_status = payload.get("trade_status", "submitted")
 
     fields = [
-        {"name": "종목명", "value": str(trade_info.get('name', 'N/A')), "inline": True},
-        {"name": "티커", "value": str(trade_info.get('ticker', 'N/A')), "inline": True},
-        {"name": "주문 수량", "value": str(trade_info.get('qty', 0)), "inline": False},
-        {"name": "주문 가격", "value": f"{trade_info.get('price', 0):,.0f} 원", "inline": True},
-        {"name": "주문 상태", "value": status.capitalize(), "inline": True},
+        {"name": "티커", "value": f"`{ticker}`", "inline": True},
+        {"name": "수량", "value": f"{qty}", "inline": True},
+        {"name": "가격", "value": f"{price:,}", "inline": True},
+        {"name": "상태", "value": f"{trade_status}", "inline": True},
     ]
 
-    # 실패 사유 추가
-    strategy_details = trade_info.get('strategy_details', {})
-    if status == 'failed' and isinstance(strategy_details, dict) and strategy_details.get('error'):
-        err_text = str(strategy_details['error'])
-        # 코드블럭 길이 제한을 고려해 슬라이스
-        fields.append({"name": "실패 사유", "value": f"```{err_text[:1800]}```", "inline": False})
-
-    embed = {
-        "title": title,
-        "color": color,
-        "fields": fields,
-        "footer": {"text": "AI Trading Bot"}
-    }
-    return embed
-
-# ───────────────── 로그 → 디스코드 핸들러 ─────────────────
-class DiscordLogHandler(logging.Handler):
-    """
-    ERROR 레벨 이상의 로그를 디스코드 웹훅으로 전송하는 핸들러.
-    - 이 핸들러는 내부에서 절대 logging.* 을 호출하지 않음 (무한 루프 방지)
-    - 재진입 방지 플래그로 동일 스레드 중복 전송 차단
-    """
-    _tls = threading.local()
-
-    def __init__(self, webhook_url: str):
-        super().__init__(level=logging.ERROR)
-        self.webhook_url = webhook_url
-
-    def emit(self, record: logging.LogRecord):
-        # 1) notifier 로거에서 발생한 로그는 무시 (자기 호출 차단)
-        if record.name.startswith("notifier"):
-            return
-
-        # 2) 재진입(예: 전송 중 예외로 다시 emit 호출) 방지
-        if getattr(self._tls, "busy", False):
-            return
-
-        # 3) 웹훅 URL 검증
-        if not is_valid_webhook(self.webhook_url):
-            # 여기서 print 사용: logging 호출 금지
-            print("[DiscordLogHandler] Invalid webhook URL. Skip sending.")
-            return
-
+    details = payload.get("strategy_details") or {}
+    if details:
+        # 긴 dict를 깔끔히 보여주기 위해 최대 900자
         try:
-            self._tls.busy = True
-            msg = self.format(record)
-            formatted = f"**⚠️ ERROR LOG DETECTED ⚠️**\n```\n{msg[:1900]}\n```"
+            import json as _json
+            pretty = _json.dumps(details, ensure_ascii=False, indent=2)
+            fields.append({"name": "Details", "value": f"```json\n{pretty[:900]}\n```", "inline": False})
+        except Exception:
+            fields.append({"name": "Details", "value": str(details)[:900], "inline": False})
 
-            payload = {"content": formatted}
-            # logging 호출 없이 직접 POST
-            resp = requests.post(self.webhook_url, json=payload, timeout=10)
-            resp.raise_for_status()
-        except Exception as e:
-            # 여기서도 logging 호출 금지
-            print(f"[DiscordLogHandler] Failed to send log to Discord: {e}")
-        finally:
-            self._tls.busy = False
-
-# ───────────────── 단독 실행 테스트 ─────────────────
-if __name__ == '__main__':
-    print("--- notifier.py 단독 테스트 시작 ---")
-
-    # 루트 로거에 핸들러 추가 (중복 방지)
-    if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
-        root_logger = logging.getLogger()
-        if not any(isinstance(h, DiscordLogHandler) for h in root_logger.handlers):
-            root_logger.addHandler(DiscordLogHandler(WEBHOOK_URL))
-    else:
-        print("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그 전송 테스트를 건너뜁니다.")
-
-    # 테스트 1: 텍스트 메시지
-    print("\n1. 텍스트 메시지 전송 테스트...")
-    send_discord_message(content="✅ 안녕하세요! notifier.py 단독 실행 테스트 메시지입니다.")
-
-    # 테스트 2: 매수 성공 임베드
-    print("\n2. 매수(BUY) 성공 임베드 전송 테스트...")
-    sample_buy_trade = {"side": "buy", "name": "삼성전자", "ticker": "005930", "qty": 10, "price": 75000, "trade_status": "completed"}
-    send_discord_message(embeds=[create_trade_embed(sample_buy_trade)])
-
-    # 테스트 3: 매도 실패 임베드
-    print("\n3. 매도(SELL) 실패 임베드 전송 테스트...")
-    sample_sell_trade = {
-        "side": "sell", "name": "카카오", "ticker": "035720", "qty": 20, "price": 55000,
-        "trade_status": "failed", "strategy_details": {"error": "증거금 부족으로 주문이 거부되었습니다."}
+    return {
+        "type": "rich",
+        "title": f" BUY {name}" if side == "BUY" else f" SELL {name}",
+        "description": f"{name} ({ticker})",
+        "fields": fields,
     }
-    send_discord_message(embeds=[create_trade_embed(sample_sell_trade)])
-
-    # 테스트 4: 에러 로그 핸들러 동작 확인 (루트 로거에 ERROR 발행)
-    print("\n4. 에러 로그 핸들러 테스트...")
-    logging.error("이것은 notifier.py에서 보내는 테스트 에러 로그입니다. 디스코드에 전송되어야 합니다.")
-
-    print("\n--- 테스트 종료 ---")
-    print("디스코드 채널에서 메시지를 확인하세요.")

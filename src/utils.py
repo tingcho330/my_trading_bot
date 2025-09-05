@@ -4,9 +4,11 @@ import json
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Iterable, Union
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import threading
+import re
 
 # ────────────────────────────────
 # 공개 심볼 (다른 모듈에서 무엇을 가져갈지 명시)
@@ -24,6 +26,10 @@ __all__ = [
     "cache_load",
     "load_account_files_with_retry",
     "extract_cash_from_summary",
+    # 추가: 계좌 스냅샷 캐시 프로바이더 & 호가 유틸
+    "get_account_snapshot_cached",
+    "get_tick_size",
+    "round_to_tick",
 ]
 
 # ────────────────────────────────
@@ -43,33 +49,34 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ────────────────────────────────
-# 로깅 설정
-#   - 모든 로그 타임스탬프를 KST 기준으로 출력
-#   - 중복 포맷팅 방지
+# 로깅 설정 (KST)
 # ────────────────────────────────
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """통합 로깅 시스템 설정 (KST 타임스탬프). 여러 번 호출해도 안전."""
     root = logging.getLogger()
     root.setLevel(level)
 
-    # 시간 포맷을 KST로 변환
     logging.Formatter.converter = lambda *args: datetime.now(KST).timetuple()
     fmt = logging.Formatter(
         "%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    # 기본 핸들러가 없으면 하나 추가
     if not root.handlers:
         ch = logging.StreamHandler()
         ch.setLevel(level)
         ch.setFormatter(fmt)
         root.addHandler(ch)
     else:
-        # 모든 핸들러에 포맷 적용
         for h in root.handlers:
             h.setFormatter(fmt)
             h.setLevel(level)
+
+    # noisy 네트워크 로깅 차단: httpx/httpcore/urllib3가 INFO 로그를 뿌리며
+    # DiscordLogHandler로 재전송되는 루프를 방지
+    for noisy in ("httpx", "httpcore", "urllib3"):
+        lg = logging.getLogger(noisy)
+        lg.setLevel(logging.WARNING)   # INFO 이하 무시
+        lg.propagate = False           # 상위(루트) 전파 금지
 
     root.debug(
         "logging initialized (KST). OUTPUT_DIR=%s, CACHE_DIR=%s, CONFIG_PATH=%s",
@@ -81,14 +88,8 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
 # ────────────────────────────────
 # 설정 파일 로더
-#   - /app/config/config.json 기본
-#   - CONFIG_PATH 환경변수로 경로 재정의 가능
 # ────────────────────────────────
 def load_config() -> Optional[Dict[str, Any]]:
-    """
-    설정 파일을 로드합니다.
-    반환: dict (성공) / None (실패)
-    """
     logger = logging.getLogger(__name__)
     path = CONFIG_PATH
     try:
@@ -108,22 +109,120 @@ def load_config() -> Optional[Dict[str, Any]]:
 
 # ────────────────────────────────
 # 장 개장일 체크 (간단: 주말 제외)
-#   - 필요 시 한국거래소 휴장일 캘린더로 확장
 # ────────────────────────────────
 def is_market_open_day() -> bool:
-    """한국 거래소 기준 평일 여부(토/일 제외)."""
     today = datetime.now(KST).date()
-    return today.weekday() < 5  # 0=월 ... 6=일
+    return today.weekday() < 5
 
 # ────────────────────────────────
-# 최신 파일 찾기 (OUTPUT_DIR 기준)
+# 내부: 파일명에서 날짜/시장/런ID 추출
+#   지원 예시:
+#     screener_candidates_full_20250903_KOSPI.json
+#     gpt_trades_20250904-134000.json
+#     balance_20250904.json, summary_20250904.json
 # ────────────────────────────────
-def find_latest_file(pattern: str) -> Optional[Path]:
-    """OUTPUT_DIR 안에서 glob 패턴에 맞는 파일 중 최신 파일 경로 반환."""
-    candidates = list(OUTPUT_DIR.glob(pattern))
+_date_patterns = [
+    re.compile(r"(?P<date>\d{8})[._-]?(?P<hms>\d{6})?"),      # 20250904 or 20250904-134000
+    re.compile(r"(?P<date>\d{8})"),                           # 20250904
+]
+_market_pattern = re.compile(r"(KOSPI|KOSDAQ|KONEX|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)", re.IGNORECASE)
+
+def _extract_meta_from_name(name: str) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {"date": None, "hms": None, "market": None}
+    for pat in _date_patterns:
+        m = pat.search(name)
+        if m:
+            meta["date"] = m.group("date")
+            if "hms" in m.groupdict():
+                meta["hms"] = m.group("hms")
+            break
+    mm = _market_pattern.search(name)
+    if mm:
+        meta["market"] = mm.group(0).upper()
+    return meta
+
+def _score_file(p: Path, prefer_date: bool = True) -> Tuple[int, int, float]:
+    """
+    스코어: (date_int, hms_int, mtime)
+    - 날짜가 없으면 0 취급
+    - prefer_date=True면 날짜/시간 우선, 동률이면 mtime
+    """
+    name = p.name
+    meta = _extract_meta_from_name(name)
+    try:
+        date_int = int(meta["date"]) if meta["date"] else 0
+    except Exception:
+        date_int = 0
+    try:
+        hms_int = int(meta["hms"]) if meta["hms"] else 0
+    except Exception:
+        hms_int = 0
+    try:
+        mtime = p.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    # 날짜 우선 정렬: (date, hms, mtime)
+    return (date_int if prefer_date else 0, hms_int if prefer_date else 0, mtime)
+
+def _iter_globs(patterns: Union[str, Iterable[str]]) -> List[Path]:
+    pats: List[str] = []
+    if isinstance(patterns, str):
+        pats = [patterns]
+    else:
+        pats = [str(x) for x in patterns]
+    seen: Dict[str, Path] = {}
+    for pat in pats:
+        for p in OUTPUT_DIR.glob(pat):
+            seen[str(p)] = p
+    return list(seen.values())
+
+# ────────────────────────────────
+# 최신 파일 찾기 (다중 패턴/마켓 필터/날짜 우선)
+# ────────────────────────────────
+def find_latest_file(
+    patterns: Union[str, Iterable[str]],
+    *,
+    market: Optional[str] = None,
+    prefer_date_over_mtime: bool = True,
+) -> Optional[Path]:
+    """
+    OUTPUT_DIR에서 patterns에 매칭되는 파일 중 '최신' 하나를 반환합니다.
+    - patterns: 문자열 패턴 또는 패턴 리스트/튜플 (e.g. "gpt_trades_*.json" or ["screener_candidates_full_*_*.json", "screener_rank_full_*_*.json"])
+    - market: "KOSPI" 등 필터(대소문자 무시). 파일명에 시장명이 포함된 경우에만 필터 적용.
+    - prefer_date_over_mtime: 파일명에 날짜가 있으면 (YYYYMMDD, optional HHMMSS) 우선,
+      날짜 동일/부재 시 mtime으로 결정.
+
+    주의: 이전 버전은 단일 패턴 + mtime 기준이었으나, 하위 호환을 위해 단일 패턴도 허용합니다.
+    """
+    logger = logging.getLogger(__name__)
+    candidates = _iter_globs(patterns)
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    mkt = (market or os.getenv("MARKET", "")).upper().strip()
+    filtered: List[Tuple[Tuple[int, int, float], Path]] = []
+
+    for p in candidates:
+        meta = _extract_meta_from_name(p.name)
+        # 마켓 필터: 파일명에 마켓 문자열이 있는 경우에만 필터링
+        if mkt and meta.get("market") and meta["market"] != mkt:
+            continue
+        score = _score_file(p, prefer_date=prefer_date_over_mtime)
+        filtered.append((score, p))
+
+    if not filtered:
+        # 마켓 필터로 모두 제외되었을 수 있으니, 경고 로그 후 전체에서 mtime 기준 fallback
+        logger.debug("find_latest_file: market=%s 필터로 후보가 비어 fallback(mtime) 실행", mkt or "NONE")
+        try:
+            return max(candidates, key=lambda x: x.stat().st_mtime)
+        except Exception:
+            return None
+
+    # 날짜/시간/mtime 우선 순위 정렬
+    # (date, hms, mtime)를 키로 하여 가장 큰 값을 선택
+    latest = max(filtered, key=lambda t: t[0])[1]
+    return latest
 
 # ────────────────────────────────
 # 캐시 유틸리티 (pickle)
@@ -178,7 +277,6 @@ def _parse_summary_payload(obj: dict) -> Dict[str, str]:
     return {}
 
 def _parse_balance_payload(obj: dict) -> List[Dict]:
-    """보유 종목 리스트 파싱"""
     if not obj:
         return []
     data = obj.get("data", [])
@@ -267,6 +365,150 @@ def extract_cash_from_summary(summary_dict: Dict[str, str]) -> Dict[str, int]:
 
     cash_map["available_cash"] = available
     return cash_map
+
+# ────────────────────────────────
+# Account Snapshot Provider (파일 mtime/락 기반 캐시)
+# ────────────────────────────────
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_SNAPSHOT_CACHE: Dict[str, Any] = {
+    "ts": 0.0,                # 캐시 생성 시각 (epoch)
+    "summary_path": None,     # 마지막 사용 summary 파일 경로
+    "balance_path": None,     # 마지막 사용 balance 파일 경로
+    "summary_mtime": 0.0,     # summary 파일 mtime
+    "balance_mtime": 0.0,     # balance 파일 mtime
+    "summary": {},            # 파싱된 summary
+    "balance": [],            # 파싱된 balance
+}
+_SNAPSHOT_LOCKFILE = Path(os.getenv("ACCOUNT_SNAPSHOT_LOCK", "/tmp/account_snapshot.lock"))
+_SNAPSHOT_TTL_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_TTL_SEC", "90"))  # 기본 90초
+_SNAPSHOT_WAIT_ON_LOCK_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_WAIT_SEC", "5"))  # 락이 있으면 최대 대기
+
+def _files_unchanged(summary_path: Optional[Path], balance_path: Optional[Path],
+                     cached_summary_mtime: float, cached_balance_mtime: float) -> bool:
+    try:
+        sm_ok = (summary_path is None) or (summary_path.exists() and abs(summary_path.stat().st_mtime - cached_summary_mtime) < 1e-6)
+        bl_ok = (balance_path is None) or (balance_path.exists() and abs(balance_path.stat().st_mtime - cached_balance_mtime) < 1e-6)
+        return sm_ok and bl_ok
+    except Exception:
+        return False
+
+def _touch_lockfile() -> None:
+    try:
+        _SNAPSHOT_LOCKFILE.write_text(str(time.time()))
+    except Exception:
+        pass
+
+def _lock_is_recent(max_age_sec: int = 10) -> bool:
+    try:
+        if not _SNAPSHOT_LOCKFILE.exists():
+            return False
+        age = time.time() - _SNAPSHOT_LOCKFILE.stat().st_mtime
+        return age <= max_age_sec
+    except Exception:
+        return False
+
+def get_account_snapshot_cached(
+    summary_pattern: str = "summary_*.json",
+    balance_pattern: str = "balance_*.json",
+    ttl_sec: Optional[int] = None,
+) -> Tuple[Dict[str, int], List[Dict], Optional[Path], Optional[Path]]:
+    """
+    요약/잔고 파일을 읽어 캐시로 제공.
+    - 캐시 TTL(기본 90초) 내에서는 메모리 캐시 반환
+    - 캐시가 있어도 파일 mtime 변경 시 즉시 재로딩
+    - 다른 프로세스가 동시에 갱신 중이면 lockfile 존재 시 잠깐 대기 후 캐시 재확인
+    반환: (summary_dict, balance_list, summary_path, balance_path)
+    """
+    logger = logging.getLogger(__name__)
+    ttl = int(ttl_sec if ttl_sec is not None else _SNAPSHOT_TTL_SEC)
+
+    # 1) 락 파일이 최신이라면 잠깐 대기(중복 IO 억제)
+    wait_deadline = time.time() + _SNAPSHOT_WAIT_ON_LOCK_SEC
+    while _lock_is_recent() and time.time() < wait_deadline:
+        time.sleep(0.2)
+
+    with _SNAPSHOT_CACHE_LOCK:
+        now = time.time()
+        # 캐시가 유효하면 그대로 반환
+        if (now - _SNAPSHOT_CACHE["ts"]) <= ttl:
+            # 파일 변경 없는지 확인
+            sp = _SNAPSHOT_CACHE["summary_path"]
+            bp = _SNAPSHOT_CACHE["balance_path"]
+            if _files_unchanged(sp, bp, _SNAPSHOT_CACHE["summary_mtime"], _SNAPSHOT_CACHE["balance_mtime"]):
+                return (
+                    dict(_SNAPSHOT_CACHE["summary"]),
+                    list(_SNAPSHOT_CACHE["balance"]),
+                    sp,
+                    bp,
+                )
+
+        # 2) 재로딩 (락 생성 후 로드)
+        _touch_lockfile()
+        summary_dict, balance_list, summary_path, balance_path = load_account_files_with_retry(
+            summary_pattern=summary_pattern,
+            balance_pattern=balance_pattern,
+            max_wait_sec=5,
+        )
+
+        # 3) 캐시에 저장
+        try:
+            sm_mtime = summary_path.stat().st_mtime if summary_path and summary_path.exists() else 0.0
+            bl_mtime = balance_path.stat().st_mtime if balance_path and balance_path.exists() else 0.0
+        except Exception:
+            sm_mtime = bl_mtime = 0.0
+
+        _SNAPSHOT_CACHE.update({
+            "ts": now,
+            "summary_path": summary_path,
+            "balance_path": balance_path,
+            "summary_mtime": sm_mtime,
+            "balance_mtime": bl_mtime,
+            "summary": summary_dict,
+            "balance": balance_list,
+        })
+
+        # 4) 반환
+        return summary_dict, balance_list, summary_path, balance_path
+
+# ────────────────────────────────
+# 호가 단위 유틸 (표준화)
+# ────────────────────────────────
+def get_tick_size(price: float) -> int:
+    """
+    KRX 일반 호가단위 (원 기준, 단순화 버전)
+    """
+    try:
+        p = float(price)
+    except Exception:
+        p = 0.0
+    if p < 2000: return 1
+    elif p < 5000: return 5
+    elif p < 20000: return 10
+    elif p < 50000: return 50
+    elif p < 200000: return 100
+    elif p < 500000: return 500
+    else: return 1000
+
+def round_to_tick(price: float, mode: str = "nearest") -> int:
+    """
+    호가단위에 맞춰 반올림.
+      - mode='nearest' (기본): 가장 가까운 호가
+      - mode='down'          : 아래 호가
+      - mode='up'            : 위 호가
+    """
+    try:
+        p = float(price)
+    except Exception:
+        return 0
+    tick = get_tick_size(p)
+    if tick <= 0:
+        return int(round(p))
+    if mode == "down":
+        return int((p // tick) * tick)
+    if mode == "up":
+        return int(((p + tick - 1) // tick) * tick)
+    # nearest
+    return int(round(p / tick) * tick)
 
 # ────────────────────────────────
 # 모듈 로드 확인용 디버그 로그

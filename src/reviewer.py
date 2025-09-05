@@ -3,12 +3,13 @@ import os
 import json
 import logging
 import sqlite3
+import time
 import pandas as pd
 import numpy as np
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from collections import defaultdict
 
 # --- 프로젝트 공통 유틸리티 및 모듈 임포트 ---
@@ -16,7 +17,10 @@ from utils import (
     setup_logging,
     load_config,
     OUTPUT_DIR,
-    KST
+    KST,
+    find_latest_file,
+    load_account_files_with_retry,
+    _to_int_krw,  # named import ok (not via *)
 )
 from notifier import send_discord_message, is_valid_webhook
 
@@ -34,6 +38,11 @@ ANALYSIS_CSV_PATH = OUTPUT_DIR / "completed_trades_analysis.csv"
 MIN_STOP_LOSS_PCT = 0.015   # 손절 하한(1.5%)
 MAX_TAKE_PROFIT_PCT = 0.50  # 익절 상한(50%)
 CONSECUTIVE_FAILURES_THRESHOLD = 3  # 연속 부진 임계
+
+# --- 사이클 컨텍스트 (scheduler가 env로 주입) ---
+RUN_ID = os.getenv("RUN_ID", "")
+RUN_STARTED_AT = float(os.getenv("RUN_STARTED_AT", "0") or 0)
+RUN_SUCCESS = os.getenv("RUN_SUCCESS", "").lower() == "true"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -93,10 +102,7 @@ def update_review_log(last_trade_id: int, consecutive_failures: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# DB 로드: 미검토 거래 가져오기(일반화, 안전한 정규화/검증 포함)
-# trades 스키마 가정 컬럼(가급적):
-#   id, timestamp, ticker, name?, side('buy'|'sell'), qty, price,
-#   pnl_amount?, sell_reason?, gpt_score?, gpt_analysis?, strategy_name?, parent_trade_id?
+# DB 로드: 미검토 거래 가져오기
 # ─────────────────────────────────────────────────────────────────────────
 def fetch_new_trades(last_trade_id: int) -> pd.DataFrame:
     if not DB_PATH.exists():
@@ -144,7 +150,6 @@ def fetch_new_trades(last_trade_id: int) -> pd.DataFrame:
 
 # ─────────────────────────────────────────────────────────────────────────
 # FIFO 매칭: 매도별 실현손익 재계산
-# 반환 컬럼: sell_id, profit
 # ─────────────────────────────────────────────────────────────────────────
 def match_trades_fifo(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -177,7 +182,6 @@ def match_trades_fifo(df: pd.DataFrame) -> pd.DataFrame:
             completed.append({
                 'sell_id': int(sell['id']),
                 'profit': float(profit),
-                # 아래 값들은 CSV/분석 확장을 위한 힌트
                 'sell_t': sell['timestamp'],
                 'sell_price': float(sell['price']),
                 'sell_qty': float(sell['qty']),
@@ -210,7 +214,7 @@ def analyze_performance(completed_df: pd.DataFrame) -> Dict:
     반환:
       - num_completed_trades: 체결 완료(매도 기준) 거래 수
       - win_rate: 승률
-      - profit_factor: 이익합 / 손실합(절댓값) (손실이 0이면 inf)
+      - profit_factor: 이익합 / 손실합(절댓값)
       - last_trade_id: 마지막 매도 트랜잭션 ID
       - total_pnl: 전체 실현손익 합계
     """
@@ -251,7 +255,7 @@ def analyze_performance(completed_df: pd.DataFrame) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 자동 튜닝 (서킷 브레이커 포함) + 디스코드 알림
+# 자동 튜닝 (서킷 브레이커 포함) — ⚠️중간 알림 없음(사이클 종료 1회 원칙)
 # ─────────────────────────────────────────────────────────────────────────
 def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
     """
@@ -271,18 +275,14 @@ def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
     if is_poor_performance:
         consecutive_failures += 1
         logger.warning(f"성과 부진 감지. 연속 실패 횟수: {consecutive_failures}")
-
         if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD:
-            msg = (
-                f"🚨 **[경고] {consecutive_failures}회 연속으로 성과가 부진합니다.**\n"
-                f"자동 파라미터 튜닝을 중단합니다. 전략/리스크 규칙의 근본 점검이 필요합니다."
+            logger.critical(
+                f"[경고] {consecutive_failures}회 연속으로 성과가 부진합니다. "
+                f"자동 파라미터 튜닝을 중단합니다. 전략/리스크 규칙 점검 필요."
             )
-            logger.critical(msg)
-            if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
-                send_discord_message(content=msg)
             return consecutive_failures
     else:
-        consecutive_failures = 0  # 성과가 좋으면 실패 횟수 초기화
+        consecutive_failures = 0
 
     # 승률 저하 시: 손절 강화(5% 강화, Floor 적용)
     if win_rate < 0.5:
@@ -308,20 +308,11 @@ def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
             json.dump(config, f, indent=2, ensure_ascii=False)
         logger.info(f"전략 파라미터가 수정되어 '{CONFIG_PATH}'에 저장되었습니다. {strategy_params}")
 
-        if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
-            summary = (
-                f"[Reviewer] 자동 튜닝 적용\n"
-                f"- win_rate: {win_rate:.2%}, PF: {profit_factor:.2f}\n"
-                f"- stop_loss_pct: {strategy_params.get('stop_loss_pct')}\n"
-                f"- take_profit_pct: {strategy_params.get('take_profit_pct')}"
-            )
-            send_discord_message(content=summary)
-
     return consecutive_failures
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# CSV 내보내기 (가능한 필드 최대한 채움: GPT 점수도 추출 시도)
+# CSV 내보내기 (가능한 필드 최대한 채움)
 # ─────────────────────────────────────────────────────────────────────────
 def _safe_get_gpt_scores(gpt_json) -> Dict:
     out = {"FinScore": None, "TechScore": None, "SectorScore": None}
@@ -337,25 +328,16 @@ def _safe_get_gpt_scores(gpt_json) -> Dict:
 
 
 def build_completed_trades_detail(raw_df: pd.DataFrame, fifo_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    raw_df: fetch_new_trades로 읽은 원본 거래
-    fifo_df: match_trades_fifo 결과(매도별 매칭 조각)
-    반환: 매도건(sell_id) 단위의 요약 레코드 집합(가능한 필드 채움)
-    """
     if fifo_df.empty:
         return pd.DataFrame()
 
-    # sell_id 단위 집계
     groups = []
     for sell_id, g in fifo_df.groupby('sell_id'):
-        # sell 행(원본 DF에서)
         sell_rows = raw_df[raw_df['id'] == sell_id]
         if sell_rows.empty:
-            # sell 레코드가 안 보이면 스킵
             continue
         sell = sell_rows.iloc[0]
 
-        # 매칭된 buy들의 가중 평균 매입가, 최초 buy 시각
         total_qty = float(g['buy_qty'].sum()) if 'buy_qty' in g.columns else float(sell.get('qty', 0))
         if total_qty <= 0:
             total_qty = float(sell.get('qty', 0))
@@ -369,18 +351,15 @@ def build_completed_trades_detail(raw_df: pd.DataFrame, fifo_df: pd.DataFrame) -
         sell_t = pd.to_datetime(sell['timestamp'])
         holding_days = (sell_t - first_buy_t).days if (first_buy_t is not None and pd.notna(first_buy_t)) else None
 
-        # 실현손익 합계(해당 sell_id)
         pnl_amount = float(g['profit'].sum())
         sell_qty = float(sell.get('qty', np.nan))
         sell_price = float(sell.get('price', np.nan))
         denom = (avg_buy_price * sell_qty) if (sell_qty and avg_buy_price and not np.isnan(avg_buy_price)) else np.nan
         pnl_rate_pct = (pnl_amount / denom) * 100 if denom and denom != 0 and not np.isnan(denom) else np.nan
 
-        # GPT 점수 추출(가능 시)
         gpt_score = float('nan')
         fin = tech = sector = None
         try:
-            # 매칭된 buy 중 gpt_score/gpt_analysis가 있는 첫 항목 사용
             cand = g.dropna(subset=['buy_gpt_analysis']) if 'buy_gpt_analysis' in g.columns else pd.DataFrame()
             if not cand.empty:
                 scores = _safe_get_gpt_scores(cand.iloc[0]['buy_gpt_analysis'])
@@ -418,12 +397,10 @@ def build_completed_trades_detail(raw_df: pd.DataFrame, fifo_df: pd.DataFrame) -
 
 
 def export_analysis_to_csv(detail_df: pd.DataFrame):
-    """분석 데이터를 CSV 파일로 저장합니다."""
     if detail_df is None or detail_df.empty:
         logger.info("CSV 내보내기: 저장할 완료 거래가 없습니다.")
         return
 
-    # 저장 컬럼 우선순위
     final_cols = [
         'sell_id', 'ticker', 'name',
         'buy_timestamp', 'sell_timestamp', 'holding_days',
@@ -441,71 +418,103 @@ def export_analysis_to_csv(detail_df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 사이클 요약(요청 사양) — 단 1회 전송
+# ─────────────────────────────────────────────────────────────────────────
+def send_cycle_summary():
+    try:
+        start_dt = pd.to_datetime(RUN_STARTED_AT, unit='s') if RUN_STARTED_AT else None
+        with sqlite3.connect(DB_PATH) as conn:
+            if start_dt is not None:
+                q = "SELECT side, COUNT(*) c FROM trades WHERE timestamp >= ? GROUP BY side"
+                cnt = pd.read_sql_query(q, conn, params=[start_dt.isoformat()])
+            else:
+                q = "SELECT side, COUNT(*) c FROM trades GROUP BY side"
+                cnt = pd.read_sql_query(q, conn)
+        buy_n = int(cnt.loc[cnt['side'] == 'buy', 'c'].sum()) if not cnt.empty else 0
+        sell_n = int(cnt.loc[cnt['side'] == 'sell', 'c'].sum()) if not cnt.empty else 0
+
+        # 보류: 최신 gpt_trades 파일
+        hold_n = 0
+        p = find_latest_file("gpt_trades_*.json")
+        if p:
+            plans = json.loads(Path(p).read_text(encoding='utf-8'))
+            hold_n = sum(1 for x in plans if x.get("결정") == "보류")
+
+        # 총평가 Δ (2회 샘플)
+        s1, _, sp1, _ = load_account_files_with_retry()
+        time.sleep(1)
+        s2, _, sp2, _ = load_account_files_with_retry()
+        def tv(s): return _to_int_krw(s.get('tot_evlu_amt', 0)) if s else 0
+        delta = tv(s2) - tv(s1) if s1 and s2 else None
+
+        color = 3066993 if RUN_SUCCESS else 16711680
+        title = f"파이프라인 사이클 요약 (run_id={RUN_ID or 'N/A'})"
+        fields = [
+            {"name": "성공여부", "value": "성공" if RUN_SUCCESS else "실패", "inline": True},
+            {"name": "소요시간", "value": (f"{(time.time() - RUN_STARTED_AT):.0f}s" if RUN_STARTED_AT else "N/A"), "inline": True},
+            {"name": "매수/매도/보류", "value": f"{buy_n} / {sell_n} / {hold_n}", "inline": False},
+            {"name": "총평가 Δ", "value": (f"{delta:+,}원" if delta is not None else "N/A"), "inline": True}
+        ]
+        embed = {"title": title, "color": color, "fields": fields, "footer": {"text": "AI Trading Bot"}}
+        if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
+            send_discord_message(embeds=[embed])
+        logger.info(f"사이클 요약 전송 완료: run_id={RUN_ID}, 성공={RUN_SUCCESS}, 매수/매도/보류={buy_n}/{sell_n}/{hold_n}, Δ={delta}")
+    except Exception as e:
+        logger.warning(f"사이클 요약 카드 전송 실패: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 파이프라인
 # ─────────────────────────────────────────────────────────────────────────
 def run_reviewer(min_trades_for_review: int = 5, export_csv: bool = False):
     """
     성과 분석 및 튜닝 전체 파이프라인 실행
-    - 최근 미검토 거래를 읽고, FIFO로 체결 쌍을 매칭
-    - 최소 N건 이상이면 성과 계산 및 자동 튜닝
-    - 리뷰 로그(last_trade_id, consecutive_failures) 갱신
-    - 옵션에 따라 CSV 저장
+    (사이클 종료 시 요약 1회 전송)
     """
     logger.info("=" * 60)
     logger.info("▶ 매매 성과 분석(Reviewer)을 시작합니다.")
 
+    # ── 분석 수행(중간 디스코드 알림 없음)
     last_info = get_last_review_info()
     last_id = int(last_info.get('last_trade_id', 0))
-    logger.info(f"마지막 리뷰 ID: {last_id}")
-
     raw = fetch_new_trades(last_id)
-    if raw.empty:
-        logger.info("새로운 거래가 없어 종료합니다.")
-        return
 
-    # 최소 거래 수(전체 raw 기준) 체크: 너무 적으면 튜닝/CSV 미수행
-    if len(raw) < 2:
-        logger.info("새로운 거래 기록이 부족하여 분석을 건너뜁니다.")
-        update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
-        return
+    if not raw.empty:
+        # 최소 레코드 체크
+        if len(raw) >= 2:
+            fifo = match_trades_fifo(raw)
+            if not fifo.empty and fifo['sell_id'].nunique() >= int(min_trades_for_review):
+                metrics = analyze_performance(fifo)
+                if metrics:
+                    consecutive_failures = tune_parameters(metrics, last_info)
+                    update_review_log(metrics['last_trade_id'], consecutive_failures)
+                else:
+                    update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
+            else:
+                update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
+        else:
+            update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
 
-    fifo = match_trades_fifo(raw)
+        if export_csv:
+            try:
+                fifo = match_trades_fifo(raw)
+                if not fifo.empty:
+                    detail = build_completed_trades_detail(raw, fifo)
+                    export_analysis_to_csv(detail)
+            except Exception as e:
+                logger.warning(f"CSV 내보내기 중 예외(무시): {e}")
 
-    if fifo.empty:
-        logger.info("완료된(매수-매도 매칭된) 거래가 없어 튜닝을 건너뜁니다.")
-        update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
-        return
+    # ── 사이클 요약(단 1회 전송)
+    send_cycle_summary()
 
-    # 매도건(독립 sell_id) 기준으로 최소 분석건 체크
-    completed_sells = int(fifo['sell_id'].nunique())
-    if completed_sells < int(min_trades_for_review):
-        logger.info(
-            f"완료된 거래가 {completed_sells}건으로, 분석 최소 기준({min_trades_for_review}건)에 미달. 튜닝/CSV 건너뜀."
-        )
-        update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
-        return
-
-    # 성과 계산
-    metrics = analyze_performance(fifo)
-    if metrics:
-        consecutive_failures = tune_parameters(metrics, last_info)
-        update_review_log(metrics['last_trade_id'], consecutive_failures)
-        logger.info("✅ 성과 분석 및 자동 튜닝 완료.")
-    else:
-        logger.info("성과 지표 생성 실패. 튜닝을 건너뜁니다.")
-        update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
-
-    # CSV 저장 옵션
-    if export_csv:
-        detail = build_completed_trades_detail(raw, fifo)
-        export_analysis_to_csv(detail)
+    logger.info("✅ Reviewer 종료(사이클 요약 1회 전송).")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Trading Performance Reviewer (FIFO Matching + Auto Tuner + CSV)")
+    parser = argparse.ArgumentParser(description="Trading Performance Reviewer (FIFO Matching + Auto Tuner + CSV + Cycle Summary)")
     parser.add_argument(
         "--min-trades",
         type=int,

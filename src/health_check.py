@@ -35,7 +35,7 @@ def _notify(msg: str):
 # ─────────── 메인 ───────────
 def main():
     logger.info("API 헬스 체크를 시작합니다...")
-    _notify("🩺 KIS API 헬스체크 시작")
+    _notify("ߩꠋIS API 헬스체크 시작")
 
     try:
         kis = KIS(env="prod")

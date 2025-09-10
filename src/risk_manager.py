@@ -12,9 +12,10 @@ from typing import Dict, Tuple, Optional, List
 from utils import (
     KST,
     OUTPUT_DIR,
-    load_account_files_with_retry,
     extract_cash_from_summary,
-    setup_logging,  # ← 공통 로깅 초기화
+    setup_logging,          # ← 공통 로깅 초기화
+    in_time_windows,        # ← 시간창 판별 (고정)
+    get_account_snapshot_cached,  # ← 읽기는 utils 캐시 사용
 )
 from notifier import (
     DiscordLogHandler,
@@ -45,6 +46,7 @@ else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
 ACCOUNT_SCRIPT_PATH = "/app/src/account.py"
+TRADER_SCRIPT_PATH = "/app/src/trader.py"  # [NEW] 파이프라인 트리거 대상
 
 # ── 장중 정의(평일 09:00~15:30) ────────────────────────────────────────
 MARKET_START = dt_time(9, 0)
@@ -90,8 +92,10 @@ def sleep_until_kst(when_dt: datetime):
             return
         pytime.sleep(min(remain, 900))  # 최대 15분 간격으로 슬립
 
-# ── 알림 쿨다운 ────────────────────────────────────────────────────────
+# ── 알림/트리거 쿨다운 ─────────────────────────────────────────────────
 _last_sent: Dict[str, float] = {}
+_last_trigger: Dict[str, float] = {}  # [NEW] 파이프라인 트리거 쿨다운
+
 def _notify(msg: str, key: str = "risk_manager", cooldown_sec: int = 300) -> None:
     """디스코드 알림(쿨다운 적용). 실패해도 파이프라인 저지하지 않음."""
     try:
@@ -99,10 +103,18 @@ def _notify(msg: str, key: str = "risk_manager", cooldown_sec: int = 300) -> Non
         if key not in _last_sent or now - _last_sent[key] >= cooldown_sec:
             _last_sent[key] = now
             if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
-                # notifier.py 최신 시그니처에 맞춤
                 send_discord_message(content=msg)
     except Exception:
         pass
+
+def _can_trigger(key: str, cooldown_sec: int) -> bool:
+    """[NEW] 파이프라인 기동 쿨다운"""
+    now = pytime.time()
+    last = _last_trigger.get(key, 0.0)
+    if now - last >= cooldown_sec:
+        _last_trigger[key] = now
+        return True
+    return False
 
 # ── 데이터 클래스: 규칙 파라미터 ─────────────────────────────────────────
 @dataclass
@@ -112,6 +124,12 @@ class SellRules:
     take_profit_buffer: float = 0.0   # 목표가 대비 추가 버퍼(비율)
     rsi_take_profit: Optional[float] = 75.0  # RSI가 이 값 이상이면 이익실현 고려(None이면 비활성)
     max_holding_days: Optional[int] = None   # 보유일수 상한(None이면 비활성)
+    # [NEW] 전일 종가 이탈 + 시간대 로직
+    prev_close_break_sell: bool = False          # 전일 종가 하회 시 매도 규칙 활성화
+    prev_close_buffer_pct: float = 0.003         # 전일 종가 대비 추가 버퍼(예: 0.003 => -0.3%)
+    time_windows_for_sells: Optional[List[str]] = None  # 매도 전반 허용 시간대(예: ["09:05-14:50","15:00-15:20"])
+    time_windows_for_take_profit: Optional[List[str]] = None  # 이익실현만 허용 시간대(없으면 전반 윈도우 사용)
+    confirm_bars_for_break: int = 0              # [단순 버전] 확인봉 개수(일봉 기준, 0=미사용)
 
 # ── 유틸 함수들 ────────────────────────────────────────────────────────
 def _to_int(x) -> int:
@@ -155,6 +173,7 @@ class RiskManager:
     - settings(settings.py의 settings 객체)를 받아 리스크 파라미터를 로드
     - check_sell_condition(holding, stock_info) 제공
     - 필요 시 계좌 스냅샷(account.py) 트리거하는 헬퍼 제공
+    - [NEW] 보유 0일 때 트레이딩 파이프라인 자동 기동(조건부)
     """
 
     def __init__(self, settings_obj):
@@ -169,54 +188,95 @@ class RiskManager:
             take_profit_buffer=float(rp.get("take_profit_buffer", 0.0)),
             rsi_take_profit=(float(rp["rsi_take_profit"]) if rp.get("rsi_take_profit") is not None else None),
             max_holding_days=(int(rp["max_holding_days"]) if rp.get("max_holding_days") is not None else None),
+            # [NEW] 전일 종가 + 시간대
+            prev_close_break_sell=bool(rp.get("prev_close_break_sell", False)),
+            prev_close_buffer_pct=float(rp.get("prev_close_buffer_pct", 0.003)),
+            time_windows_for_sells=rp.get("time_windows_for_sells") or rp.get("time_windows") or None,
+            time_windows_for_take_profit=rp.get("time_windows_for_take_profit") or None,
+            confirm_bars_for_break=int(rp.get("confirm_bars_for_break", 0)),
         )
 
+        # [NEW] 자동 파이프라인 트리거 설정
+        self.auto_trigger_when_empty: bool = bool(rp.get("auto_trigger_trader_when_empty", True))
+        self.auto_trigger_cooldown_sec: int = int(rp.get("auto_trigger_cooldown_sec", 900))  # 15분
+        self.min_cash_to_trigger: int = int(rp.get("min_cash_to_trigger", 100_000))
+        self.buy_time_windows: List[str] = rp.get("buy_time_windows") or ["09:05-14:50"]
+
         logger.info(f"RiskManager 초기화 완료 (env={self.env})")
+        # [NEW] 전일 종가 캐시(세션 단위)
+        self._prev_close_cache: Dict[str, int] = {}
 
     # ── screener_core 호출로 실시간 지표/레벨 ───────────────────────────
     def compute_realtime_levels(self, ticker: str, entry_price: float) -> Dict:
         """
         손절가/목표가/RSI 계산(파일 참조 없이 함수 호출).
         - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
+        인터페이스 보장: 항상 {'손절가','목표가','RSI','Price','source'} 포함.
         """
-        out: Dict = {"Ticker": str(ticker).zfill(6), "Price": int(round(float(entry_price)))}
+        t = str(ticker).zfill(6)
+        ep = float(entry_price)
+        risk_params = self.config.get("risk_params", {}) or {}
 
-        # 1) 손절/목표가
+        # 기본 페이로드 + 퍼센트 백업(선적용, 이후 코어 계산 성공 시 덮어씀)
+        out: Dict = {
+            "Ticker": t,
+            "Price": int(round(ep)),
+            "RSI": 50.0,
+            **_percent_backup_levels(ep, risk_params),
+        }
+
+        # 1) 손절/목표가 (성공 시만 덮어쓰기)
         try:
             date_str = datetime.now(KST).strftime("%Y%m%d")
-            risk_params = self.config.get("risk_params", {}) or {}
-            levels = _compute_levels(str(ticker).zfill(6), float(entry_price), date_str, risk_params)
+            levels = _compute_levels(t, ep, date_str, risk_params)
             if isinstance(levels, dict):
-                out.update({k: levels.get(k) for k in ("손절가", "목표가", "source") if k in levels})
+                if "손절가" in levels and "목표가" in levels:
+                    out["손절가"] = int(round(_to_float(levels["손절가"], out["손절가"])))
+                    out["목표가"] = int(round(_to_float(levels["목표가"], out["목표가"])))
+                out["source"] = str(levels.get("source") or out.get("source") or "core_levels")
         except Exception as e:
-            logger.warning(f"[{ticker}] 손절/목표가 계산 실패: {e}")
+            logger.warning(f"[{t}] 손절/목표가 계산 실패: {e} (백업 사용)")
 
         # 2) RSI
         try:
             end_dt = datetime.now(KST)
             start_dt = end_dt - timedelta(days=365)
-            df = get_historical_prices(
-                str(ticker).zfill(6),
-                start_dt.strftime("%Y%m%d"),
-                end_dt.strftime("%Y%m%d"),
-            )
+            df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
             if df is not None and not df.empty:
                 close_col = "Close" if "Close" in df.columns else [c for c in df.columns if c.lower() == "close"][0]
-                rsi_val = float(calculate_rsi(df[close_col]))
-                out["RSI"] = round(rsi_val, 2)
-            else:
-                out["RSI"] = 50.0
+                out["RSI"] = round(float(calculate_rsi(df[close_col])), 2)
         except Exception as e:
-            logger.warning(f"[{ticker}] RSI 계산 실패: {e}")
-            out["RSI"] = 50.0
+            logger.warning(f"[{t}] RSI 계산 실패: {e} (기본 50.0 사용)")
 
+        # (선택) 미러링 필드
+        out["levels_source"] = out.get("source")
         return out
 
-    # ── 계좌 스냅샷 로드/트리거 ────────────────────────────────────────
-    def refresh_account_snapshot(self) -> Tuple[Dict[str, int], List[Dict], Optional[str], Optional[str]]:
+    # ── [NEW] 전일 종가 조회(세션 캐시) ───────────────────────────────
+    def _get_prev_close(self, ticker: str) -> Optional[int]:
+        t = str(ticker).zfill(6)
+        if t in self._prev_close_cache:
+            return self._prev_close_cache[t]
+        try:
+            end_dt = datetime.now(KST)
+            start_dt = end_dt - timedelta(days=10)  # 주말 포함 여유
+            df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
+            if df is None or len(df) < 2:
+                return None
+            close_col = "Close" if "Close" in df.columns else [c for c in df.columns if c.lower() == "close"][0]
+            prev_close = float(df[close_col].iloc[-2])
+            val = int(round(prev_close))
+            self._prev_close_cache[t] = val
+            return val
+        except Exception as e:
+            logger.debug(f"[{t}] 전일 종가 조회 실패: {e}")
+            return None
+
+    # ── 계좌 스냅샷 트리거/읽기 분리 ────────────────────────────────────
+    def trigger_account_snapshot(self) -> bool:
         """
-        account.py를 실행해 최신 summary/balance 생성 후 읽어온다.
-        return: (cash_info_dict, holdings_list, summary_file, balance_file)
+        account.py를 실행해 최신 summary/balance 파일을 생성만 합니다.
+        읽기는 호출측(트레이더)에서 utils.get_account_snapshot_cached 사용 권장.
         """
         try:
             subprocess.run(
@@ -227,17 +287,25 @@ class RiskManager:
                 encoding="utf-8",
             )
             logger.info("(RiskManager) account.py 자동 실행 완료")
+            return True
         except subprocess.CalledProcessError as e:
             logger.error(f"(RiskManager) account.py 실행 실패: exit={e.returncode}\n{e.stderr}")
         except FileNotFoundError:
             logger.error(f"(RiskManager) account.py 경로를 찾지 못했습니다: {ACCOUNT_SCRIPT_PATH}")
         except Exception as e:
             logger.error(f"(RiskManager) account.py 실행 중 예외: {e}")
+        return False
 
-        summary_dict, balance_list, summary_path, balance_path = load_account_files_with_retry(
+    def refresh_account_snapshot(self) -> Tuple[Dict[str, int], List[Dict], Optional[str], Optional[str]]:
+        """
+        [호환 유지] 최신 스냅샷을 생성 → utils 캐시로 읽어 반환합니다.
+        return: (cash_info_dict, holdings_list, summary_file, balance_file)
+        """
+        self.trigger_account_snapshot()
+        summary_dict, balance_list, summary_path, balance_path = get_account_snapshot_cached(
             summary_pattern="summary_*.json",
             balance_pattern="balance_*.json",
-            max_wait_sec=5,
+            ttl_sec=5,  # 즉시 재로딩 유도(파일 mtime 변화 감지)
         )
         cash_map = extract_cash_from_summary(summary_dict)
         return (
@@ -247,11 +315,79 @@ class RiskManager:
             str(balance_path) if balance_path else None,
         )
 
+    # ── [NEW] 보유 0일 때 트레이딩 파이프라인 자동 기동 ────────────────
+    def _should_trigger_trader(self, cash_map: Dict[str, int], holdings: List[Dict]) -> Tuple[bool, str]:
+        """
+        트레이더 자동 기동 조건 판단.
+        - 보유수량 총합 0
+        - 장중 & 매수 시간 창
+        - available_cash(없으면 dnca_tot_amt) >= min_cash_to_trigger
+        - 쿨다운 내 중복 트리거 방지
+        """
+        if not self.auto_trigger_when_empty:
+            return False, "auto_trigger_trader_when_empty=False"
+
+        # 보유수량 총합
+        total_qty = sum(int(str(h.get("hldg_qty", 0)).replace(",", "")) for h in holdings)
+        if total_qty > 0:
+            return False, f"holdings_qty>0 ({total_qty})"
+
+        now = datetime.now(KST)
+        if not is_market_hours(now):
+            return False, "장외"
+
+        # 매수 시간 창
+        if not in_time_windows(now, self.buy_time_windows):
+            return False, f"매수 시간대 아님: {self.buy_time_windows}"
+
+        available = int(cash_map.get("available_cash") or cash_map.get("dnca_tot_amt") or 0)
+        if available < self.min_cash_to_trigger:
+            return False, f"가용 현금 부족 {available:,} < {self.min_cash_to_trigger:,}"
+
+        # 쿨다운
+        if not _can_trigger("trigger_trader_when_empty", self.auto_trigger_cooldown_sec):
+            return False, "쿨다운"
+
+        return True, "OK"
+
+    def _trigger_trader_pipeline_once(self) -> bool:
+        """
+        trader.py를 단발 실행. 성공/실패 여부 반환.
+        """
+        try:
+            logger.info("[AUTO] 보유 0 & 조건 충족 → trader.py 자동 기동")
+            res = subprocess.run(
+                ["python", str(TRADER_SCRIPT_PATH)],
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding="utf-8",
+                timeout=1200,  # 20분 안전 타임아웃
+            )
+            head = (res.stdout or "")[-600:]
+            logger.info("[AUTO] trader.py 완료. tail:\n%s", head)
+            _notify("🤖 보유 0 → 트레이딩 파이프라인 자동 기동 완료", key="auto_trigger_trader_ok", cooldown_sec=300)
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error("[AUTO] trader.py 실패: exit=%s\nstdout:\n%s\nstderr:\n%s",
+                         e.returncode, (e.stdout or "")[-600:], (e.stderr or "")[-600:])
+            _notify("❌ 보유 0 → 트레이딩 파이프라인 기동 실패", key="auto_trigger_trader_fail", cooldown_sec=300)
+        except subprocess.TimeoutExpired:
+            logger.error("[AUTO] trader.py 타임아웃")
+            _notify("⏱️ 보유 0 → 트레이딩 파이프라인 타임아웃", key="auto_trigger_trader_fail", cooldown_sec=300)
+        except FileNotFoundError:
+            logger.error("[AUTO] trader.py 경로를 찾지 못함: %s", TRADER_SCRIPT_PATH)
+            _notify("❗ trader.py를 찾지 못했습니다.", key="auto_trigger_trader_fail", cooldown_sec=300)
+        except Exception as e:
+            logger.error("[AUTO] trader.py 기동 중 예외: %s", e, exc_info=True)
+            _notify(f"❗ trader.py 기동 중 예외: {e}", key="auto_trigger_trader_fail", cooldown_sec=300)
+        return False
+
     # ── 매도 판단 로직 ────────────────────────────────────────────────
     def check_sell_condition(self, holding: Dict, stock_info: Dict) -> Tuple[str, str]:
         """
         보유 종목/스크리너 정보 기반 매도 판단.
-        return: ("SELL" or "HOLD", reason)
+        return: ("SELL" or "KEEP", reason)
         요구사항:
           - stop/target이 들어오면 최우선 사용, 없으면 퍼센트 백업 즉시 산출
           - RSI 미존재 시 50.0으로 대체하고 (지표부재) 표기
@@ -262,7 +398,7 @@ class RiskManager:
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))  # 현재가
         if qty <= 0 or cur_price <= 0:
-            return "HOLD", f"{name}({ticker}) 수량/가격 정보 부족"
+            return "KEEP", f"{name}({ticker}) 수량/가격 정보 부족"
 
         # 입력 손절/목표 우선
         stop_px_in = _to_float(stock_info.get("손절가"), 0.0)
@@ -271,7 +407,6 @@ class RiskManager:
 
         # 없으면 퍼센트 백업 즉시 산출
         if stop_px_in <= 0 or take_px_in <= 0:
-            # 진입가가 있으면 사용, 없으면 현재가로 백업 계산
             entry_price = _to_float(holding.get("pchs_avg_pric"), 0.0) or float(cur_price)
             backup = _percent_backup_levels(entry_price, self.config.get("risk_params", {}) or {})
             stop_px = float(backup["손절가"]); take_px = float(backup["목표가"])
@@ -279,7 +414,6 @@ class RiskManager:
         else:
             stop_px, take_px = float(stop_px_in), float(take_px_in)
             if not levels_source:
-                # 가격은 있는데 source 누락 시 표시
                 levels_source = "unknown"
 
         # 버퍼 적용
@@ -292,17 +426,24 @@ class RiskManager:
         rsi = _to_float(rsi_raw, 50.0)
         rsi_note = " (지표부재)" if rsi_missing else ""
 
-        # 1) 손절 전략
-        if stop_threshold > 0 and cur_price <= stop_threshold:
+        # 공통: 시간대 허용 여부
+        # in_time_windows(now, None or []) → True 특성에 맞춰 None/빈 리스트면 True로 처리
+        now_kst = datetime.now(KST)
+        sell_win_ok = True if not self.rules.time_windows_for_sells else in_time_windows(now_kst, self.rules.time_windows_for_sells)
+        tp_base = self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells
+        tp_win_ok = True if not tp_base else in_time_windows(now_kst, tp_base)
+
+        # 1) 손절 전략 (시간대 필터 적용)
+        if stop_threshold > 0 and cur_price <= stop_threshold and sell_win_ok:
             return (
                 "SELL",
-                f"손절가 도달({cur_price:,} ≤ {int(round(stop_threshold)):,}) | 전략=StopLoss, levels_source={levels_source}"
+                f"손절가 도달({cur_price:,} ≤ {int(round(stop_threshold)):,}) | 전략=StopLoss, levels_source={levels_source} | win={self.rules.time_windows_for_sells or 'ALL'}"
             )
-        # 2) 목표가 전략
-        if tp_threshold > 0 and cur_price >= tp_threshold:
+        # 2) 목표가 전략 (시간대 필터 적용: 없으면 전반 윈도우 사용)
+        if tp_threshold > 0 and cur_price >= tp_threshold and tp_win_ok:
             return (
                 "SELL",
-                f"목표가 도달({cur_price:,} ≥ {int(round(tp_threshold)):,}) | 전략=TakeProfit, levels_source={levels_source}"
+                f"목표가 도달({cur_price:,} ≥ {int(round(tp_threshold)):,}) | 전략=TakeProfit, levels_source={levels_source} | win={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'}"
             )
         # 3) RSI 과열 전략
         if self.rules.rsi_take_profit is not None and rsi >= float(self.rules.rsi_take_profit):
@@ -310,6 +451,17 @@ class RiskManager:
                 "SELL",
                 f"RSI 과열({rsi:.1f}≥{float(self.rules.rsi_take_profit):.1f}{rsi_note}) | 전략=RSI_TP, levels_source={levels_source}"
             )
+        # 3.5) 전일 종가 이탈 전략 (시간대 필터 + 버퍼)
+        if self.rules.prev_close_break_sell and sell_win_ok:
+            prev_close = self._get_prev_close(ticker)
+            if prev_close and prev_close > 0:
+                thresh = int(round(prev_close * (1.0 - float(self.rules.prev_close_buffer_pct))))
+                if cur_price <= thresh:
+                    confirm_note = f", confirm={self.rules.confirm_bars_for_break}D" if self.rules.confirm_bars_for_break > 0 else ""
+                    return (
+                        "SELL",
+                        f"전일 종가 이탈({cur_price:,} ≤ {thresh:,}) | 전략=PrevCloseBreak{confirm_note}, levels_source={levels_source} | prev_close={prev_close:,} | win={self.rules.time_windows_for_sells or 'ALL'}"
+                    )
         # 4) 보유일수 상한
         if self.rules.max_holding_days and stock_info.get("entry_date"):
             try:
@@ -325,9 +477,10 @@ class RiskManager:
 
         # 유지
         return (
-            "HOLD",
+            "KEEP",
             f"유지: {name}({ticker}) 현재가={cur_price:,}, 손절={int(round(stop_px)) if stop_px else 'N/A'}, "
             f"목표={int(round(take_px)) if take_px else 'N/A'}, RSI={rsi:.1f}{rsi_note}, levels_source={levels_source}"
+            f", win_sell={self.rules.time_windows_for_sells or 'ALL'}"
         )
 
     # ── 상태 요약(디스코드/로그) ────────────────────────────────────────
@@ -353,6 +506,13 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
     logger.info("\n" + msg + f"\nfiles: {b_path}, {s_path}")
     if notify_summary:
         _notify(" 계좌 요약\n" + msg, key="risk_summary", cooldown_sec=600)
+
+    # [NEW] 보유 0이면 트레이딩 파이프라인 조건부 기동
+    ok, why = rm._should_trigger_trader(cash, holds)
+    if ok:
+        rm._trigger_trader_pipeline_once()
+    else:
+        logger.info(f"[AUTO] 파이프라인 미기동: {why}")
 
     # 2) 각 보유 종목: 손절/목표가/RSI 즉시 계산 후 판단
     if holds:
@@ -391,12 +551,24 @@ if __name__ == "__main__":
                 "take_profit_buffer": 0.0,
                 "rsi_take_profit": 75,
                 "max_holding_days": None,
+                # 시간대/전일종가 규칙 샘플
+                # "time_windows_for_sells": ["09:05-14:50"],
+                # "time_windows_for_take_profit": ["09:05-15:20"],
+                # "prev_close_break_sell": True,
+                # "prev_close_buffer_pct": 0.003,
+                # "confirm_bars_for_break": 0,
                 # screener_core._compute_levels 에서 사용하는 키들(없어도 퍼센트 백업 경로 동작)
                 "atr_period": 14,
                 "atr_k_stop": 1.5,
                 "swing_lookback": 20,
                 "reward_risk": 2.0,
                 "stop_pct": 0.03,
+
+                # [AUTO TRIGGER DEFAULTS]
+                "auto_trigger_trader_when_empty": True,
+                "auto_trigger_cooldown_sec": 900,
+                "min_cash_to_trigger": 100_000,
+                "buy_time_windows": ["09:05-14:50"],
             }
         }
 

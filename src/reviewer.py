@@ -7,7 +7,7 @@ import time
 import pandas as pd
 import numpy as np
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from collections import defaultdict
@@ -19,8 +19,8 @@ from utils import (
     OUTPUT_DIR,
     KST,
     find_latest_file,
-    load_account_files_with_retry,
-    _to_int_krw,  # named import ok (not via *)
+    get_account_snapshot_cached,  # ← 최신 스냅샷 utils 경유
+    _to_int_krw,                  # named import ok (not via *)
 )
 from notifier import send_discord_message, is_valid_webhook
 
@@ -31,6 +31,8 @@ logger = logging.getLogger("Reviewer")
 # --- 상수 정의 ---
 DB_PATH = OUTPUT_DIR / "trading_log.db"
 REVIEW_LOG_PATH = OUTPUT_DIR / "review_log.json"
+ROTATION_LOG_PATH = OUTPUT_DIR / "rotation_log.json"
+TRADE_CONTEXT_LOG_PATH = OUTPUT_DIR / "trade_context_log.json"  # 거래 컨텍스트 로그
 CONFIG_PATH = Path("/app/config/config.json")  # 설정 파일 경로 명시
 ANALYSIS_CSV_PATH = OUTPUT_DIR / "completed_trades_analysis.csv"
 
@@ -67,6 +69,42 @@ WEBHOOK_URL = _load_webhook_url()
 # ─────────────────────────────────────────────────────────────────────────
 # 리뷰 로그 I/O
 # ─────────────────────────────────────────────────────────────────────────
+def append_json(file_path: Path, record: dict):
+    """JSON 파일에 레코드를 리스트 형태로 추가합니다."""
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        if file_path.exists():
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if not isinstance(data, list):
+                    data = [data]  # 기존 dict 를 list로 변환
+        else:
+            data = []
+        data.append(record)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except (IOError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to append to JSON file {file_path}: {e}")
+
+def record_trade_context(ctx: dict):
+    """
+    거래 당시의 근거/지표를 함께 저장하여 사후 성과 분석에 활용
+    """
+    rec = {
+        "ts": datetime.now().isoformat(),
+        "ticker": ctx["ticker"],
+        "action": ctx["action"],  # BUY/SELL/SKIP/ROTATION
+        "score_total": ctx.get("score_total"),
+        "score_components": ctx.get("score_components"),
+        "vol_kki": ctx.get("vol_kki"),
+        "pos_52w": ctx.get("pos_52w"),
+        "exclude_reasons": ctx.get("exclude_reasons", []),
+        "gpt_rationale": ctx.get("gpt_rationale",""),
+        "reason_code": ctx.get("reason_code",""),
+        "rotation": ctx.get("rotation", None)  # {from_ticker,to_ticker,delta}
+    }
+    append_json(TRADE_CONTEXT_LOG_PATH, rec)
+
 def get_last_review_info() -> dict:
     """마지막 리뷰 기록(ID, 날짜, 연속 실패 횟수)을 로드합니다."""
     if not REVIEW_LOG_PATH.exists():
@@ -74,6 +112,8 @@ def get_last_review_info() -> dict:
     try:
         with open(REVIEW_LOG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
+            if not isinstance(data, dict):
+                return {"last_trade_id": 0, "consecutive_failures": 0}
             if "consecutive_failures" not in data:
                 data["consecutive_failures"] = 0
             if "last_trade_id" not in data:
@@ -255,12 +295,15 @@ def analyze_performance(completed_df: pd.DataFrame) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 자동 튜닝 (서킷 브레이커 포함) — ⚠️중간 알림 없음(사이클 종료 1회 원칙)
+# 자동 튜닝 (서킷 브레이커 포함)
 # ─────────────────────────────────────────────────────────────────────────
-def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
+def tune_parameters(performance_metrics: dict, last_review_info: dict, *, apply_changes: bool = False) -> int:
     """
     성과 지표에 따라 config.json의 전략 파라미터를 동적으로 조정합니다.
     성과 부진 정의: win_rate < 0.5 또는 profit_factor < 1.5
+    - apply_changes=False(기본): 드라이런(변경사항 로그만 출력)
+    - apply_changes=True: 실제 파일에 반영
+    반환값: 업데이트된 consecutive_failures
     """
     config = load_config()
     strategy_params = config.get("strategy_params", {}) or {}
@@ -269,6 +312,7 @@ def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
     profit_factor = float(performance_metrics.get('profit_factor', 0.0))
 
     config_changed = False
+    planned_changes = {}
     is_poor_performance = (win_rate < 0.5) or (profit_factor < 1.5)
     consecutive_failures = int(last_review_info.get("consecutive_failures", 0))
 
@@ -289,20 +333,31 @@ def tune_parameters(performance_metrics: dict, last_review_info: dict) -> int:
         original = float(strategy_params.get('stop_loss_pct', 0.05))
         new_value = max(round(original * 0.95, 4), MIN_STOP_LOSS_PCT)
         if not np.isclose(new_value, original):
-            strategy_params['stop_loss_pct'] = new_value
-            logger.info(f"승률 저하({win_rate:.2%}) -> 손절 강화: {original:.3f} -> {new_value:.3f}")
-            config_changed = True
+            planned_changes['stop_loss_pct'] = (original, new_value)
+            if apply_changes:
+                strategy_params['stop_loss_pct'] = new_value
+                config_changed = True
 
     # 손익비 저하 시: 익절 상향(5% 상향, Ceiling 적용)
     if profit_factor < 1.5:
         original = float(strategy_params.get('take_profit_pct', 0.10))
         new_value = min(round(original * 1.05, 4), MAX_TAKE_PROFIT_PCT)
         if not np.isclose(new_value, original):
-            strategy_params['take_profit_pct'] = new_value
-            logger.info(f"손익비 저하({profit_factor:.2f}) -> 익절 상향: {original:.3f} -> {new_value:.3f}")
-            config_changed = True
+            planned_changes['take_profit_pct'] = (original, new_value)
+            if apply_changes:
+                strategy_params['take_profit_pct'] = new_value
+                config_changed = True
 
-    if config_changed:
+    # 변경 계획 로그
+    if planned_changes:
+        msg_lines = ["[튜닝 계획]"]
+        for k, (old, new) in planned_changes.items():
+            msg_lines.append(f" - {k}: {old:.4f} → {new:.4f} ({'적용' if apply_changes else '드라이런'})")
+        logger.info("\n".join(msg_lines))
+    else:
+        logger.info("튜닝 변경 계획 없음.")
+
+    if apply_changes and config_changed:
         config['strategy_params'] = strategy_params
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -440,10 +495,10 @@ def send_cycle_summary():
             plans = json.loads(Path(p).read_text(encoding='utf-8'))
             hold_n = sum(1 for x in plans if x.get("결정") == "보류")
 
-        # 총평가 Δ (2회 샘플)
-        s1, _, sp1, _ = load_account_files_with_retry()
-        time.sleep(1)
-        s2, _, sp2, _ = load_account_files_with_retry()
+        # 총평가 Δ (2회 샘플) — utils 캐시 리더 사용
+        s1, _, sp1, _ = get_account_snapshot_cached()
+        time.sleep(2)  # ← 파일 갱신 지연 대비, 1초 → 2초로 확대
+        s2, _, sp2, _ = get_account_snapshot_cached()
         def tv(s): return _to_int_krw(s.get('tot_evlu_amt', 0)) if s else 0
         delta = tv(s2) - tv(s1) if s1 and s2 else None
 
@@ -466,13 +521,16 @@ def send_cycle_summary():
 # ─────────────────────────────────────────────────────────────────────────
 # 파이프라인
 # ─────────────────────────────────────────────────────────────────────────
-def run_reviewer(min_trades_for_review: int = 5, export_csv: bool = False):
+def run_reviewer(min_trades_for_review: int = 5, export_csv: bool = False, *, tune_parameters_enabled: bool = False):
     """
-    성과 분석 및 튜닝 전체 파이프라인 실행
+    성과 분석 및 튜닝 전체 파이프라인 실행 (DB→FIFO→성과지표→튜닝)
+    - tune_parameters_enabled=False(기본): 드라이런(설정 변경 없이 리포트/로그만)
+    - tune_parameters_enabled=True : 실제 설정 파일에 전략 파라미터 반영
     (사이클 종료 시 요약 1회 전송)
     """
     logger.info("=" * 60)
-    logger.info("▶ 매매 성과 분석(Reviewer)을 시작합니다.")
+    logger.info("▶ 매매 성과 분석(Reviewer)을 시작합니다. "
+                f"[드라이런={'아니오' if tune_parameters_enabled else '예'}]")
 
     # ── 분석 수행(중간 디스코드 알림 없음)
     last_info = get_last_review_info()
@@ -486,7 +544,9 @@ def run_reviewer(min_trades_for_review: int = 5, export_csv: bool = False):
             if not fifo.empty and fifo['sell_id'].nunique() >= int(min_trades_for_review):
                 metrics = analyze_performance(fifo)
                 if metrics:
-                    consecutive_failures = tune_parameters(metrics, last_info)
+                    consecutive_failures = tune_parameters(
+                        metrics, last_info, apply_changes=bool(tune_parameters_enabled)
+                    )
                     update_review_log(metrics['last_trade_id'], consecutive_failures)
                 else:
                     update_review_log(int(raw['id'].max()), int(last_info.get("consecutive_failures", 0)))
@@ -514,7 +574,9 @@ def run_reviewer(min_trades_for_review: int = 5, export_csv: bool = False):
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Trading Performance Reviewer (FIFO Matching + Auto Tuner + CSV + Cycle Summary)")
+    parser = argparse.ArgumentParser(
+        description="Trading Performance Reviewer (FIFO Matching + Auto Tuner + CSV + Cycle Summary)"
+    )
     parser.add_argument(
         "--min-trades",
         type=int,
@@ -526,6 +588,22 @@ if __name__ == "__main__":
         action="store_true",
         help="분석 결과를 completed_trades_analysis.csv 파일로 저장합니다."
     )
+    # 드라이런 기본값 유지, --tune 주면 실제 적용
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--tune",
+        action="store_true",
+        help="자동 튜닝 결과를 config.json에 실제로 반영합니다(기본: 드라이런)."
+    )
+    group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="설정 변경 없이 리포트만 생성합니다(기본 동작)."
+    )
     args = parser.parse_args()
 
-    run_reviewer(min_trades_for_review=args.min_trades, export_csv=args.export_csv)
+    run_reviewer(
+        min_trades_for_review=args.min_trades,
+        export_csv=args.export_csv,
+        tune_parameters_enabled=bool(args.tune)
+    )

@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, List, Any, Tuple
 from pathlib import Path
+import threading
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -27,12 +29,17 @@ from utils import (
     find_latest_file,
     is_market_open_day,
     KST,  # ← generated_at용
+    get_cfg,
+    compute_52w_position,
+    compute_kki_metrics,
+    count_consecutive_up,
+    is_newly_listed,
 )
 
-# ---- 스키마 메타 ----
-SCHEMA_VERSION = "1.1"
+# ─────── 스키마 메타 ───────
+SCHEMA_VERSION = "1.2"  # Output schema pinned
 
-# ---- load_config 폴백 ----
+# ---- load_config 폴백 (get_cfg가 주력이지만 호환성을 위해 유지) ----
 def _load_config_fallback() -> dict:
     """utils.load_config가 없거나 실패할 때 쓰는 폴백 로더"""
     cfg_path = getattr(utils, "CONFIG_PATH", Path("/app/config/config.json"))
@@ -57,10 +64,10 @@ from notifier import (
 
 # ───────────────── 계산 코어 (부작용 없음) ─────────────────
 from screener_core import (
-    _compute_levels,          # 손절/목표가 계산 (ATR/스윙 기반, 퍼센트 백업)
-    get_historical_prices,    # 과거 시세 조회 (pykrx 우선, fdr 백업)
-    calculate_rsi,            # RSI 계산
-    calculate_atr,            # ATR 계산
+    _compute_levels,         # 손절/목표가 계산 (ATR/스윙 기반, 퍼센트 백업)
+    get_historical_prices,   # 과거 시세 조회 (pykrx 우선, fdr 백업)
+    calculate_rsi,           # RSI 계산
+    calculate_atr,           # ATR 계산 (대문자 OHLC 기대)
 )
 
 # ───────────────── 기본 설정/로깅 ─────────────────
@@ -123,7 +130,203 @@ def _describe_series(name: str, s: pd.Series):
         f"{int(s_num.max()):,}",
     )
 
-# ─────────── 데이터/지표 함수 ───────────
+# ─────────── 상장일(KIS) 캐시 ───────────
+from api.kis_auth import KIS
+_KIS_INSTANCE: Optional[KIS] = None
+
+# 메모리 캐시
+_LISTING_DATES_CACHE: Dict[str, Optional[datetime]] = {}
+_LISTING_PREFETCHED = False
+_LISTING_LOCK = threading.Lock()
+
+def _parse_listing_date_value(v: Any) -> Optional[datetime]:
+    """KIS 응답의 다양한 상장일 필드를 datetime으로 변환"""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if fmt in ("%Y%m%d", "%Y-%m-%d") and len(digits) >= 8:
+                return datetime.strptime(digits[:8], "%Y%m%d")
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 8:
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d")
+        except Exception:
+            pass
+    return None
+
+def _extract_listing_date_from_kis_df(df: pd.DataFrame) -> Optional[datetime]:
+    """inquire_price 응답에서 상장일 후보 컬럼 추출"""
+    if df is None or df.empty:
+        return None
+    candidates = [
+        "lstg_dt", "lstg_de", "lstg_st_dt", "list_dt", "list_dd", "list_dttm",
+        "list_dtm", "ipo_dt", "ipo_de", "opn_dd"
+    ]
+    cols_map = {str(c).strip().lower(): c for c in df.columns}
+    for key in candidates:
+        low = key.lower()
+        if low in cols_map:
+            val = df[cols_map[low]].iloc[0]
+            dt = _parse_listing_date_value(val)
+            if dt:
+                return dt
+    for c in df.columns:
+        val = df[c].iloc[0]
+        dt = _parse_listing_date_value(val)
+        if dt:
+            return dt
+    return None
+
+def _kis_inquire_price_safe(kis: KIS, code: str) -> Optional[pd.DataFrame]:
+    try:
+        return kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
+    except Exception as e:
+        logger.debug("KIS inquire_price 실패(%s): %s", code, e)
+        return None
+
+# === 신규 추가: 공개 API ===
+def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, workers: int = 4) -> None:
+    """
+    요청한 날짜 키(date_str) 기준으로 KIS 상장일을 일괄 프리패치해
+    - 메모리 캐시(_LISTING_DATES_CACHE)
+    - 파일 캐시(cache_save("kis_listing", date_str, ...))
+    에 저장한다.
+    """
+    if not codes:
+        return
+    uniq = [str(c).zfill(6) for c in pd.unique(pd.Series(codes))]
+
+    # 파일 캐시가 있으면 먼저 로딩
+    cached = cache_load("kis_listing", date_str)
+    if isinstance(cached, dict) and cached:
+        logger.info("상장일(KIS) 캐시 로드: kis_listing_%s.pkl", date_str)
+        with _LISTING_LOCK:
+            for k, v in cached.items():
+                if isinstance(v, str):
+                    try:
+                        cached_dt = datetime.strptime(v, "%Y-%m-%d")
+                    except Exception:
+                        cached_dt = _parse_listing_date_value(v)
+                else:
+                    cached_dt = v
+                _LISTING_DATES_CACHE[str(k).zfill(6)] = cached_dt
+
+    # 아직 없는 코드만 병렬 조회
+    targets = []
+    with _LISTING_LOCK:
+        for c in uniq:
+            if c not in _LISTING_DATES_CACHE or _LISTING_DATES_CACHE[c] is None:
+                targets.append(c)
+    if not targets:
+        logger.info("상장일(KIS) 일괄 조회 스킵(모든 대상이 캐시에 있음).")
+        return
+
+    logger.info("상장일(KIS) 일괄 조회 시작 (대상 %d종목)", len(targets))
+    def _fetch(code: str) -> Tuple[str, Optional[datetime]]:
+        df = _kis_inquire_price_safe(kis, code)
+        dt = _extract_listing_date_from_kis_df(df) if df is not None else None
+        return code, dt
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(_fetch, c): c for c in targets}
+        total = len(futs)
+        done = 0
+        for i, fut in enumerate(as_completed(futs), start=1):
+            code, dt = fut.result()
+            with _LISTING_LOCK:
+                _LISTING_DATES_CACHE[code] = dt
+            done += 1
+            logger.info("  >> 상장일(KIS) 조회 진행: %d/%d (%.1f%%)", i, total, i * 100.0 / total)
+
+    # 파일 캐시에 전체 저장(이미 있던 값 포함)
+    with _LISTING_LOCK:
+        serializable = {k: (v.strftime("%Y-%m-%d") if isinstance(v, datetime) else None) for k, v in _LISTING_DATES_CACHE.items()}
+    cache_save("kis_listing", date_str, serializable)
+    logger.info("상장일(KIS) 일괄 조회 완료: %d건 캐시", done)
+
+# 유지: 내부 사용(기존 이름과 호환)
+def prefetch_listing_dates_kis(codes: List[str], kis: KIS, workers: int = 4):
+    # date_str은 비즈니스 날짜 키로 묶어 저장
+    date_key = datetime.now().strftime("%Y%m%d")
+    return get_listing_date_kis_prefetch(kis, codes, date_key, workers)
+
+def get_listing_date(ticker: str) -> Optional[datetime]:
+    """상장일을 캐시에서 반환. 없으면 KIS 단건 조회(조용히)."""
+    code = str(ticker).zfill(6)
+    with _LISTING_LOCK:
+        if code in _LISTING_DATES_CACHE:
+            return _LISTING_DATES_CACHE[code]
+    kis = _KIS_INSTANCE
+    if kis is None:
+        return None
+    df = _kis_inquire_price_safe(kis, code)
+    dt = _extract_listing_date_from_kis_df(df) if df is not None else None
+    with _LISTING_LOCK:
+        _LISTING_DATES_CACHE[code] = dt
+    return dt
+
+# ─────────── 스코어링 실패 집계 ───────────
+_fail_stats = defaultdict(int)
+_fail_rows: List[Dict[str, Any]] = []
+_fail_lock = threading.Lock()
+
+def standardize_ohlcv(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """
+    다양한 컬럼명(영문 소문자/한글/조정종가/변형명)을 표준 OHLCV로 매핑.
+    반환: (표준화 DF or None, 실패사유 or None)
+    """
+    if df is None or df.empty:
+        return None, "empty_price"
+
+    d = df.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+
+    cand = {
+        "open":   ["open", "시가"],
+        "high":   ["high", "고가"],
+        "low":    ["low", "저가"],
+        "close":  ["close", "종가", "adj close", "adj_close", "adjclose", "adjusted_close", "close*"],
+        "volume": ["volume", "거래량", "vol"],
+    }
+
+    def _find(names: List[str]) -> Optional[str]:
+        for n in names:
+            if n.endswith("*"):
+                base = n[:-1]
+                cand_cols = [c for c in d.columns if c.startswith(base)]
+                if cand_cols:
+                    return cand_cols[0]
+            elif n in d.columns:
+                return n
+        return None
+
+    out = {}
+    for key, names in cand.items():
+        found = _find(names)
+        if found is None:
+            if key == "volume":
+                out["Volume"] = pd.Series(0, index=d.index)  # volume 없으면 0
+            else:
+                return None, f"missing_{key}"
+        else:
+            out[key.capitalize()] = d[found]
+
+    std = pd.DataFrame(out, index=d.index)
+    try:
+        std = std.sort_index()
+    except Exception:
+        pass
+    return std, None
+
+# ─────────── 나머지 데이터/지표 ───────────
 def get_stock_listing(market: str = "KOSPI") -> pd.DataFrame:
     logger.info("종목 목록 조회(FDR): market=%s", market)
     df = fdr.StockListing(market)
@@ -152,7 +355,7 @@ def get_fundamentals(date_str: str, market: str = "KOSPI") -> pd.DataFrame:
         return _norm_code_index(df)
     except Exception as e:
         logger.error("펀더멘털 조회 실패 (%s, %s): %s", date_str, market, e)
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 def get_market_trend(date_str: str) -> str:
     current_date = datetime.strptime(date_str, "%Y%m%d")
@@ -258,8 +461,6 @@ def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
     return None
 
 # ─────────── KIS 호출 & 섹터 보강 ───────────
-from api.kis_auth import KIS
-
 def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
     if cache_key:
         cached = cache_load("kis_sector_map", cache_key)
@@ -395,34 +596,67 @@ def _get_pykrx_ticker_sector_map(date_str: str) -> Dict[str, str]:
     cache_save("pykrx_sector_map", date_str, ticker_sector_map)
     return ticker_sector_map
 
+# === 신규 추가: pykrx 부분 매핑(캐시가 있으면 부분, 없으면 풀스캔 후 부분 추출) ===
+def _enrich_sector_with_pykrx_partial(missing_codes: List[str], date_str: str) -> Dict[str, str]:
+    """
+    결측 종목만 pykrx 매핑.
+    - 캐시가 있으면 캐시에서 subset 반환
+    - 캐시가 없으면 풀 매핑 생성 후 subset 반환 (성능 영향 최소화를 위해 결과를 캐시)
+    """
+    mapping = cache_load("pykrx_sector_map", date_str)
+    if not isinstance(mapping, dict) or not mapping:
+        # 캐시 없으면 한 번 생성
+        mapping = _get_pykrx_ticker_sector_map(date_str)
+    if not mapping:
+        return {}
+    miss = [str(c).zfill(6) for c in missing_codes]
+    return {c: mapping.get(c, None) for c in miss}
+
 def _calculate_sector_trends(date_str: str) -> Dict[str, float]:
+    """
+    업종(지수)별 MA5 > MA20 여부로 0/1 점수를 계산해 섹터 트렌드 맵을 만든다.
+    - 캐시 키: "sector_trends", date_str
+    - 반환: {"전기전자": 1.0, "금융": 0.0, ...}
+    """
     cached = cache_load("sector_trends", date_str)
     if cached is not None:
         logger.info("섹터 트렌드 캐시 사용: sector_trends_%s.pkl", date_str)
         return cached
+
     logger.info("KOSPI 업종별 트렌드 분석 시작...")
     sector_trends: Dict[str, float] = {}
     try:
         sector_tickers = pykrx.get_index_ticker_list(market="KOSPI")
         end_date = datetime.strptime(date_str, "%Y%m%d")
         start_date = (end_date - timedelta(days=60)).strftime("%Y%m%d")
-        for ticker in sector_tickers:
-            sector_name = pykrx.get_index_ticker_name(ticker)
+
+        for idx_ticker in sector_tickers:
+            sector_name = pykrx.get_index_ticker_name(idx_ticker)
             if str(sector_name).startswith("코스피"):
                 continue
-            df_index = pykrx.get_index_ohlcv_by_date(start_date, date_str, ticker)
+
+            df_index = pykrx.get_index_ohlcv_by_date(start_date, date_str, idx_ticker)
             if df_index is None or len(df_index) < 20:
                 continue
+
             close = df_index["종가"]
             ma5 = close.rolling(window=5).mean().iloc[-1]
             ma20 = close.rolling(window=20).mean().iloc[-1]
-            score = 0.5 if (pd.isna(ma5) or pd.isna(ma20)) else (1.0 if ma5 > ma20 else 0.0)
+
+            if pd.isna(ma5) or pd.isna(ma20):
+                score = 0.0
+            else:
+                score = 1.0 if ma5 > ma20 else 0.0
+
             sector_trends[_normalize_sector_name(sector_name)] = float(score)
+
         logger.info("✅ %d개 업종 트렌드 분석 완료.", len(sector_trends))
     except Exception as e:
         logger.error("업종 트렌드 분석 중 오류 발생: %s. 빈 데이터를 반환합니다.", e)
+
     cache_save("sector_trends", date_str, sector_trends)
     return sector_trends
+
 
 def _apply_sector_source_order(
     df_base: pd.DataFrame,
@@ -451,13 +685,34 @@ def _apply_sector_source_order(
         if len(missing_idx) == 0:
             break
         if src == "pykrx":
-            with stage("섹터 매핑(pykrx)"):
-                mapping = _get_pykrx_ticker_sector_map(date_str)
-                if mapping:
-                    filled = df.loc[missing_idx].index.to_series().map(mapping)
-                    df.loc[missing_idx, "Sector"] = filled
+            # 설정 임계값(환경변수→config 우선 순서)
+            cfg_threshold = 5
+            try:
+                cfg_threshold = int(get_cfg().get("screener_params", {}).get("pykrx_sector_min_missing", cfg_threshold))
+            except Exception:
+                try:
+                    cfg_threshold = int(os.getenv("PYKRX_SECTOR_MIN_MISSING", str(cfg_threshold)))
+                except Exception:
+                    pass
+
+            if len(missing_idx) >= cfg_threshold:
+                with stage("섹터 매핑(pykrx)"):
+                    mapping = _get_pykrx_ticker_sector_map(date_str)
+                    if mapping:
+                        filled = df.loc[missing_idx].index.to_series().map(mapping)
+                        df.loc[missing_idx, "Sector"] = filled
+                        df.loc[missing_idx[filled.notna().values], "SectorSource"] = "pykrx"
+                    _log_sector_summary(df, "pykrx 매핑 후")
+            else:
+                # ▶ 부분 매핑(캐시 기반; 없으면 풀 매핑 생성 후 subset)
+                mapping_part = _enrich_sector_with_pykrx_partial(missing_idx.tolist(), date_str)
+                if mapping_part:
+                    filled = df.loc[missing_idx].index.to_series().map(mapping_part)
+                    df.loc[missing_idx, "Sector"] = np.where(filled.notna(), filled.values, df.loc[missing_idx, "Sector"].values)
                     df.loc[missing_idx[filled.notna().values], "SectorSource"] = "pykrx"
-            _log_sector_summary(df, "pykrx 매핑 후")
+                logger.info("pykrx 부분 매핑 적용: 대상=%d, 매핑성공=%d", len(missing_idx), int(pd.Series(mapping_part).notna().sum()))
+                _log_sector_summary(df, "pykrx(부분) 매핑 후")
+
         elif src == "kis":
             logger.info("섹터 보강(KIS) 대상: %d 종목", len(missing_idx))
             kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), kis, workers, cache_key=date_str)
@@ -560,7 +815,7 @@ def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float
     except Exception:
         return {"above_ma50": 0.5, "ma50_gt_ma200": 0.5, "rsi_term": 0.5}
 
-# ─────────── 투자자별 수급 데이터 조회 (신규 추가) ───────────
+# ─────────── 투자자별 수급 데이터 조회 ───────────
 def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Optional[pd.DataFrame]:
     """지정된 기간 동안의 투자자별 거래대금(기관, 외국인 등)을 조회합니다."""
     try:
@@ -569,7 +824,6 @@ def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Op
         df_flow = pykrx.get_market_trading_value_by_date(start_date, date_str, ticker)
 
         if df_flow is not None and not df_flow.empty:
-            # pykrx 버전에 따라 대금/순매수 명칭이 다를 수 있어 통일
             df_flow = df_flow.rename(columns={
                 '기관합계대금': '기관합계',
                 '외국인합계대금': '외국인합계',
@@ -583,10 +837,6 @@ def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Op
 
 # ─────────── FDR Marcap 비정상 시 PYKRX 시총 폴백 ───────────
 def _get_marcap_series_from_pykrx(date_str: str, market: str) -> pd.Series:
-    """
-    PYKRX에서 해당 날짜의 시가총액을 받아 Series('Marcap')로 반환.
-    FDR의 Marcap이 전부 0이거나 누락된 경우 사용.
-    """
     try:
         df_mc = pykrx.get_market_cap_by_ticker(date_str, market=market)
         if df_mc is None or df_mc.empty:
@@ -603,7 +853,6 @@ def _get_marcap_series_from_pykrx(date_str: str, market: str) -> pd.Series:
                 return pd.Series(dtype="float64", name="Marcap")
             col = numeric_cols[0]
         s = pd.to_numeric(df_mc[col], errors="coerce").fillna(0)
-        # 단위가 '백만'이면 원화 환산
         if "백만" in col:
             s = s * 1_000_000
         return s.rename("Marcap")
@@ -631,7 +880,6 @@ def _filter_initial_stocks(
         logger.warning("FDR Marcap 비정상 감지 → PYKRX 시가총액으로 폴백합니다. (date=%s, market=%s)", fixed_date, market)
         mc_pykrx = _get_marcap_series_from_pykrx(fixed_date, market)
         if not mc_pykrx.empty:
-            # 충돌 방지: 기존 Marcap 제거 후 조인
             if "Marcap" in df_all.columns:
                 df_all = df_all.drop(columns=["Marcap"], errors="ignore")
             df_all = df_all.join(mc_pykrx, how="left")
@@ -673,8 +921,9 @@ def _filter_initial_stocks(
 
     # 필터링
     min_mc = float(cfg.get("min_market_cap", 0))
+    max_mc = float(cfg.get("max_market_cap", 1e13))
     min_amt = float(cfg.get("min_trading_value_5d_avg", 0))
-    mask_mc = df_pre["Marcap"] >= min_mc
+    mask_mc = (df_pre["Marcap"] >= min_mc) & (df_pre["Marcap"] <= max_mc)
     amt_num = pd.to_numeric(df_pre["Amount5D"], errors="coerce").fillna(0)
     mask_amt = amt_num >= min_amt
 
@@ -682,8 +931,8 @@ def _filter_initial_stocks(
     n1 = int(mask_mc.sum())
     n2 = int((mask_mc & mask_amt).sum())
     logger.info(
-        "단계별 생존 수: 시작=%d → Marcap(≥%s)=%d → +Amount5D(≥%s)=%d",
-        n0, f"{int(min_mc):,}", n1, f"{int(min_amt):,}", n2,
+        "단계별 생존 수: 시작=%d → Marcap(≥%s, ≤%s)=%d → +Amount5D(≥%s)=%d",
+        n0, f"{int(min_mc):,}", f"{int(max_mc):,}", n1, f"{int(min_amt):,}", n2,
     )
     logger.info(
         "탈락 사유: Marcap 미달=%d, Amount5D 미달(마켓캡 통과 중)=%d",
@@ -717,71 +966,112 @@ def _calculate_scores_for_ticker(
     cfg: Dict[str, Any],
     market_score: float,
     sector_trends: Dict[str, float],
-    risk_params: Dict[str, Any],  # ← 추가: ATR 기간은 risk_params에서 읽음
+    risk_params: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     try:
-        start_dt_str = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
-        df_price = get_historical_prices(code, start_dt_str, date_str)
-        if df_price is None or len(df_price) < 200:
+        lookback_days = int(cfg.get("history_lookback_days", 730))
+        start_dt_str = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+        df_price_raw = get_historical_prices(code, start_dt_str, date_str)
+
+        # 표준화
+        df_price, std_err = standardize_ohlcv(df_price_raw)
+        if std_err is not None:
+            with _fail_lock:
+                _fail_stats[std_err] += 1
+                _fail_rows.append({"Ticker": code, "reason": std_err})
             return None
 
-        close = df_price["Close"].iloc[-1]
-        ma50 = df_price["Close"].rolling(50).mean().iloc[-1]
-        ma200 = df_price["Close"].rolling(200).mean().iloc[-1]
-        rsi = calculate_rsi(df_price["Close"])
+        # 계산 창 슬라이싱
+        calc_window_days = int(cfg.get("calc_window_days", 365))
+        if calc_window_days > 0 and len(df_price) > calc_window_days:
+            df_price = df_price.tail(calc_window_days)
 
-        # --- ATR 계산: risk_params에서 기간 사용 ---
+        # ▶ price_short 방지/기록
+        min_history_bars = int(cfg.get("min_history_bars", 200))
+        if df_price is None or len(df_price) < min_history_bars:
+            with _fail_lock:
+                _fail_stats["price_short"] += 1
+                _fail_rows.append({
+                    "Ticker": code, "reason": "price_short",
+                    "len": float(len(df_price) if df_price is not None else 0),
+                })
+            return None
+
+        # --- 제외 필터 ---
+        exclude_reasons = []
+        # 신규상장 제외 (KIS 캐시 우선)
+        # 요청사항: LISTING_CACHE 우선 → 그 다음 get_listing_date
+        listing_dt = _LISTING_DATES_CACHE.get(str(code).zfill(6)) or get_listing_date(code)
+        newly_days = int(cfg.get("exclude_newly_listed_days", 60))
+        if listing_dt is not None and newly_days > 0:
+            if is_newly_listed(listing_dt, datetime.now(), newly_days):
+                exclude_reasons.append("NEWLY_LISTED")
+
+        # 지표 계산
+        close_series = df_price["Close"]
+        close = close_series.iloc[-1]
+        ma50 = close_series.rolling(50).mean().iloc[-1]
+        ma200 = close_series.rolling(200).mean().iloc[-1]
+
+        rsi_series = calculate_rsi(close_series.dropna())
+        rsi = rsi_series.iloc[-1] if isinstance(rsi_series, pd.Series) and len(rsi_series) else (float(rsi_series) if rsi_series is not None else np.nan)
+
         atr_period = int((risk_params or {}).get("atr_period", 14))
         atr_val = calculate_atr(df_price, period=atr_period)
 
         if any(pd.isna(x) for x in [ma50, ma200, rsi]):
+            with _fail_lock:
+                _fail_stats["nan_indicators"] += 1
+                _fail_rows.append({"Ticker": code, "reason": "nan_indicators"})
             return None
 
-        # --- 투자자별 수급 데이터 조회 추가 ---
+        # 연속 양봉 제외
+        try:
+            df_price_lower = df_price.rename(str.lower, axis=1)
+            if count_consecutive_up(df_price_lower.tail(10)) >= int(cfg.get("exclude_consecutive_up_days", 3)):
+                exclude_reasons.append("UP_STREAK")
+        except Exception as e:
+            with _fail_lock:
+                _fail_stats["up_streak_calc"] += 1
+                _fail_rows.append({"Ticker": code, "reason": "up_streak_calc", "msg": f"{type(e).__name__}:{str(e)[:160]}"})
+
         df_investor_flow = get_investor_flow(code, date_str)
-
-        tech_score = (
-            (1 if close > ma50 else 0)
-            + (1 if ma50 > ma200 else 0)
-            + (max(0, 1 - abs(rsi - 50) / 50))
-        ) / 3
-
+        
+        # --- 컴포넌트 스코어 계산 ---
+        tech_score = ((1 if close > ma50 else 0) + (1 if ma50 > ma200 else 0) + (max(0, 1 - abs(rsi - 50) / 50))) / 3
         per_val = pd.to_numeric(fin_info.get("PER"), errors="coerce")
         pbr_val = pd.to_numeric(fin_info.get("PBR"), errors="coerce")
         per_term = max(0, min(1, (50 - per_val) / 50)) if pd.notna(per_val) and per_val > 0 else 0
         pbr_term = max(0, min(1, (5 - pbr_val) / 5)) if pd.notna(pbr_val) and pbr_val > 0 else 0
         fin_score = 0.5 * (per_term + pbr_term)
-
         sector_name = str(fin_info.get("Sector", "N/A")) if "Sector" in fin_info else "N/A"
         sector_score = float(sector_trends.get(sector_name, 0.5))
+        
+        # 신규 스코어
+        df_price_lower_for_kki = df_price.rename(str.lower, axis=1)
+        vol_kki = compute_kki_metrics(df_price_lower_for_kki)
+        pos_52w = compute_52w_position(close_series)
 
-        ma20_up = analyze_ma20_trend(df_price)
-        accum_vol = analyze_accumulation_volume(df_price)
-        hl_trend = detect_higher_lows(df_price)
-        consd = detect_consolidation(df_price)
-        yey = detect_yey_pattern(df_price)
-        pattern_flags = [ma20_up, accum_vol, hl_trend, consd, yey]
-        pattern_score = float(np.mean(pattern_flags)) if pattern_flags else 0.0
+        # --- 가중치 및 최종 스코어 ---
+        fin_w = float(cfg.get("fin_weight", 0.25))
+        tech_w = float(cfg.get("tech_weight", 0.30))
+        mkt_w = float(cfg.get("mkt_weight", 0.15))
+        sector_w = float(cfg.get("sector_weight", 0.15))
+        vol_kki_w = float(cfg.get("vol_kki_weight", 0.10))
+        pos_52w_w = float(cfg.get("pos_52w_weight", 0.05))
 
-        fin_w = float(cfg.get("fin_weight", 0.5))
-        tech_w = float(cfg.get("tech_weight", 0.5))
-        mkt_w = float(cfg.get("mkt_weight", 0.0))
-        sector_w = float(cfg.get("sector_weight", 0.0))
-        pattern_w = float(cfg.get("pattern_weight", 0.0))
         total_score = (
             fin_score * fin_w
             + tech_score * tech_w
             + market_score * mkt_w
             + sector_score * sector_w
-            + pattern_score * pattern_w
+            + vol_kki * vol_kki_w
+            + pos_52w * pos_52w_w
         )
         total_score = float(np.clip(total_score, 0.0, 1.0))
-
-        # 보강: 이름/섹터소스도 함께 싣는다(후속 단계에서 중복제거 후 df_scores 기준으로 사용)
         name_val = fin_info.get("Name", "")
         sector_src = fin_info.get("SectorSource", "unknown")
 
-        # JSON 직렬화를 위해 records 형태로 변환
         return {
             "Ticker": code,
             "Name": str(name_val) if pd.notna(name_val) else "",
@@ -789,27 +1079,31 @@ def _calculate_scores_for_ticker(
             "SectorSource": str(sector_src) if pd.notna(sector_src) else "unknown",
             "Price": int(round(float(close))),
             "Score": round(float(total_score), 4),
+
             "FinScore": round(float(fin_score), 4),
             "TechScore": round(float(tech_score), 4),
             "MktScore": round(float(market_score), 4),
             "SectorScore": round(float(sector_score), 4),
-            "PatternScore": round(float(pattern_score), 4),
-            "MA20Up": bool(ma20_up),
-            "AccumVol": bool(accum_vol),
-            "HigherLows": bool(hl_trend),
-            "Consolidation": bool(consd),
-            "YEY": bool(yey),
+            "VolKki": round(float(vol_kki), 4),
+            "Pos52w": round(float(pos_52w), 4),
+
             "PER": round(float(per_val), 2) if pd.notna(per_val) else None,
             "PBR": round(float(pbr_val), 2) if pd.notna(pbr_val) else None,
             "RSI": round(float(rsi), 2),
             "ATR": round(float(atr_val), 2) if atr_val is not None else None,
             "MA50": round(float(ma50), 2),
             "MA200": round(float(ma200), 2),
-            "daily_chart": df_price.reset_index().to_dict('records') if df_price is not None else None,
+
+            "exclude_reasons": exclude_reasons,
+            "daily_chart": close_series.reset_index().to_dict('records') if close_series is not None else None,
             "investor_flow": df_investor_flow.reset_index().to_dict('records') if df_investor_flow is not None else None,
         }
+
     except Exception as ex:
-        logger.debug("[%s] 스코어 계산 예외: %s", code, ex)
+        logger.debug("[%s] 스코어 계산 예외(step=main): %s", code, ex, exc_info=True)
+        with _fail_lock:
+            _fail_stats["exception"] += 1
+            _fail_rows.append({"Ticker": code, "reason": "exception", "msg": f"main:{type(ex).__name__}:{str(ex)[:160]}"})
         return None
 
 def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) -> pd.DataFrame:
@@ -817,31 +1111,37 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
         return df_sorted.iloc[0:0]
     if sector_cap <= 0:
         return df_sorted.head(top_n)
+    
+    df_clean = df_sorted[df_sorted["exclude_reasons"].apply(len) == 0]
+    df_excluded = df_sorted[df_sorted["exclude_reasons"].apply(len) > 0]
+    
     max_per_sector = max(1, int(np.ceil(top_n * float(sector_cap))))
     sector_series = (
-        df_sorted["Sector"]
-        if "Sector" in df_sorted.columns
-        else pd.Series(["N/A"] * len(df_sorted), index=df_sorted.index)
+        df_clean["Sector"]
+        if "Sector" in df_clean.columns
+        else pd.Series(["N/A"] * len(df_clean), index=df_clean.index)
     )
     counts: Dict[str, int] = {}
     selected_idx: List[Any] = []
-    for idx, sec in zip(df_sorted.index, sector_series):
+    
+    for idx, sec in zip(df_clean.index, sector_series):
         c = counts.get(sec, 0)
         if c < max_per_sector:
             selected_idx.append(idx)
             counts[sec] = c + 1
         if len(selected_idx) >= top_n:
             break
-    if len(selected_idx) < top_n:
-        for idx in df_sorted.index:
-            if idx not in selected_idx:
-                selected_idx.append(idx)
-                if len(selected_idx) >= top_n:
-                    break
-    return df_sorted.loc[selected_idx]
+            
+    if len(selected_idx) < top_n and not df_excluded.empty:
+        need = top_n - len(selected_idx)
+        selected_idx.extend(df_excluded.index[:need].tolist())
+
+    final_df = df_sorted.loc[selected_idx]
+    return final_df.head(top_n)
 
 # ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
+    global _KIS_INSTANCE
     start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
@@ -851,11 +1151,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     ensure_output_dir()
 
-    # config 로드/병합 (utils.load_config가 없을 수 있어 방어)
-    if hasattr(utils, "load_config"):
-        settings = utils.load_config() or {}
-    else:
-        settings = _load_config_fallback()
+    # config 로드 (utils.get_cfg 사용)
+    settings = get_cfg()
 
     if config_path and Path(config_path).expanduser().is_file():
         try:
@@ -882,13 +1179,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         _notify(f"❌ {msg}", key="screener_kis_auth_fail", cooldown_sec=60)
         return
     logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
-
-    # 개장일 안내(옵션)
-    try:
-        open_day = is_market_open_day()
-        logger.info("오늘 한국 시장 개장일 여부: %s", "개장" if open_day else "휴장")
-    except Exception as e:
-        logger.warning("시장 개장일 확인 실패: %s", e)
+    _KIS_INSTANCE = kis
 
     screener_params = settings.get("screener_params", {})
     risk_params = settings.get("risk_params", {})
@@ -920,6 +1211,10 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
+    # ✅ KIS 상장일 사전 캐싱 (로그 1회, 스코어링 전) — 요청명으로 노출
+    with stage("상장일(KIS) 프리패치", notify_key=None):
+        get_listing_date_kis_prefetch(kis, list(df_filtered.index), fixed_date, workers)
+
     with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         results = []
         total = len(df_filtered)
@@ -933,7 +1228,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     screener_params,
                     market_score,
                     sector_trends,
-                    risk_params,  # ← ATR 기간 전달
+                    risk_params,
                 ): code
                 for code, row in df_filtered.iterrows()
             }
@@ -943,7 +1238,36 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 res = fut.result()
                 if res:
                     results.append(res)
+
+        # 스코어링 실패 요약 및 CSV 덤프
+        try:
+            if _fail_stats:
+                fail_sum = ", ".join(f"{k}={v}" for k, v in _fail_stats.items())
+                logger.warning("스코어링 실패 요약: %s", fail_sum)
+                dbg_dir = OUTPUT_DIR / "debug"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                fail_csv = dbg_dir / f"scoring_fail_{fixed_date}_{market}.csv"
+                pd.DataFrame(_fail_rows).to_csv(fail_csv, index=False, encoding="utf-8-sig")
+                logger.warning("스코어링 실패 상세 CSV 저장: %s", fail_csv)
+        except Exception as _e:
+            logger.debug("실패 요약/CSV 저장 중 오류: %s", _e)
+
         if not results:
+            try:
+                dbg_dir = OUTPUT_DIR / "debug"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                dbg_meta = {
+                    "date": fixed_date,
+                    "market": market,
+                    "filtered_tickers": [str(x) for x in df_filtered.index],
+                    "fail_stats": dict(_fail_stats),
+                }
+                with open(dbg_dir / f"scoring_ctx_{fixed_date}_{market}.json", "w", encoding="utf-8") as f:
+                    json.dump(dbg_meta, f, ensure_ascii=False, indent=2)
+                logger.info("스코어링 컨텍스트 저장: %s", dbg_dir / f"scoring_ctx_{fixed_date}_{market}.json")
+            except Exception as _e:
+                logger.debug("컨텍스트 저장 실패: %s", _e)
+
             msg = "❌ 2차 스크리닝 결과, 최종 후보가 없습니다."
             logger.warning(msg)
             _notify(msg, key="screener_no_candidates_stage2", cooldown_sec=60)
@@ -951,10 +1275,6 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize"):
         df_scores = pd.DataFrame(results).set_index("Ticker")
-
-        # ⚠️ 좌/우 데이터프레임 컬럼 충돌 방지:
-        # - df_scores에는 ['Name','Sector','SectorSource','Price', ...]가 포함됨
-        # - df_filtered 측의 겹치는 컬럼을 동적으로 제거하여 안전하게 join
         left = df_filtered.copy()
         right = df_scores.copy()
         overlapping = set(left.columns).intersection(set(right.columns))
@@ -962,92 +1282,132 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             logger.debug("join 전 중복 컬럼 제거: %s", sorted(overlapping))
             left = left.drop(columns=list(overlapping), errors="ignore")
 
-        # 조인 실행(인덱스=티커)
         df_final = (
             left.join(right, how="inner")
             .reset_index()
             .rename(columns={"index": "Ticker"})
         )
 
-        # 전체 정렬(무거운 컬럼 포함 상태)
-        df_sorted = df_final.sort_values("Score", ascending=False)
+        # 정렬: 제외사유 없는 것 우선, 그 다음 점수 높은 순
+        df_final["exclude_reasons_len"] = df_final["exclude_reasons"].apply(len)
+        df_sorted = df_final.sort_values(by=["exclude_reasons_len", "Score"], ascending=[True, False]).drop(columns=["exclude_reasons_len"])
 
         top_n = min(int(screener_params.get("top_n", 10)), int(risk_params.get("max_positions", 10)))
         sector_cap = float(screener_params.get("sector_cap", 0.3))
-
+        
         # 다양화
-        final_candidates = diversify_by_sector(df_sorted.set_index("Ticker"), top_n, sector_cap).reset_index()
+        final_candidates_base = diversify_by_sector(df_sorted.set_index("Ticker"), top_n, sector_cap).reset_index()
 
-        # 손절/목표가 계산 (core)
+        # ── 레벨 계산 ──
         levels_data = []
-        for _, row in final_candidates.iterrows():
+        for _, row in final_candidates_base.iterrows():
             levels = _compute_levels(row["Ticker"], row["Price"], fixed_date, risk_params)
             levels_data.append(levels)
-        df_levels = pd.DataFrame(levels_data, index=final_candidates.index)
-        final_candidates = pd.concat([final_candidates, df_levels], axis=1)
+        df_levels = pd.DataFrame(levels_data, index=final_candidates_base.index)
+        final_candidates = pd.concat([final_candidates_base, df_levels], axis=1)
 
-        # 공통 스키마 alias 추가: stop/target/levels_source
-        if "손절가" in final_candidates.columns:
+        # 필수 컬럼 보장
+        for col in ["손절가", "목표가", "source"]:
+            if col not in final_candidates.columns:
+                final_candidates[col] = None
+        if "stop_price" not in final_candidates.columns:
             final_candidates["stop_price"] = final_candidates["손절가"]
-        if "목표가" in final_candidates.columns:
+        if "target_price" not in final_candidates.columns:
             final_candidates["target_price"] = final_candidates["목표가"]
-        if "source" in final_candidates.columns:
+        if "levels_source" not in final_candidates.columns:
             final_candidates["levels_source"] = final_candidates["source"]
+        if "SectorSource" not in final_candidates.columns:
+            final_candidates["SectorSource"] = "unknown"
+        if "Sector" not in final_candidates.columns:
+            final_candidates["Sector"] = "N/A"
+        if "Score" not in final_candidates.columns:
+            final_candidates["Score"] = 0.0
 
-        # 저장할 컬럼 순서 정의 (공통 스키마 항목 포함)
+        # 컬럼 순서
         cols = [
             "Ticker", "Name", "Sector", "SectorSource", "Price",
             "손절가", "목표가", "source", "stop_price", "target_price", "levels_source",
             "MA50", "MA200", "Score",
-            "FinScore", "TechScore", "MktScore", "SectorScore", "PatternScore",
-            "MA20Up", "AccumVol", "HigherLows", "Consolidation", "YEY",
-            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D",
+            "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
+            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D", "exclude_reasons",
         ]
         keep = [c for c in cols if c in final_candidates.columns]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]
 
-        # 무거운 컬럼 정의
         drop_cols = ["daily_chart", "investor_flow"]
-
-        # ── 메타 필드 주입(레코드 레벨) ─────────────────────────
         generated_at = datetime.now(KST).isoformat()
-        # 랭킹 전체(풀/슬림)
+        
+        # 랭킹/후보 두 버전 생성(풀/슬림)
         df_sorted_full = df_sorted.reset_index(drop=True).copy()
         df_sorted_full["schema_version"] = SCHEMA_VERSION
         df_sorted_full["generated_at"] = generated_at
-
         df_sorted_slim = df_sorted.drop(columns=drop_cols, errors="ignore").reset_index(drop=True).copy()
         df_sorted_slim["schema_version"] = SCHEMA_VERSION
         df_sorted_slim["generated_at"] = generated_at
 
-        # 최종 후보(풀/슬림)
         final_candidates_full = final_candidates.copy()
         final_candidates_full["schema_version"] = SCHEMA_VERSION
         final_candidates_full["generated_at"] = generated_at
-
         final_candidates_slim = final_candidates.drop(columns=drop_cols, errors="ignore").copy()
         final_candidates_slim["schema_version"] = SCHEMA_VERSION
         final_candidates_slim["generated_at"] = generated_at
-        # ─────────────────────────────────────────────────────────
+
+        # ▶ 스크리너 단계에서는 '요청 플래그만' 기록 (Trader에서 실제 필터링)
+        aff_req = bool(settings.get("screener_params", {}).get("affordability_filter", False))
+        for df_ in (df_sorted_full, df_sorted_slim, final_candidates_full, final_candidates_slim):
+            df_["affordability_filter_requested"] = aff_req
 
         # 파일 경로
         rank_full_json   = OUTPUT_DIR / f"screener_rank_full_{fixed_date}_{market}.json"
         rank_slim_json   = OUTPUT_DIR / f"screener_rank_{fixed_date}_{market}.json"
         cands_full_json  = OUTPUT_DIR / f"screener_candidates_full_{fixed_date}_{market}.json"
         cands_slim_json  = OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json"
+        scores_json      = OUTPUT_DIR / f"screener_scores_{fixed_date}_{market}.json"
+        meta_json        = OUTPUT_DIR / f"screener_meta_{fixed_date}_{market}.json"
 
         # 저장
         df_sorted_full.to_json(rank_full_json, orient="records", indent=2, force_ascii=False)
         df_sorted_slim.to_json(rank_slim_json, orient="records", indent=2, force_ascii=False)
         final_candidates_full.to_json(cands_full_json, orient="records", indent=2, force_ascii=False)
         final_candidates_slim.to_json(cands_slim_json, orient="records", indent=2, force_ascii=False)
+        
+        # 보유 종목 점수 캐시 (트레이더 교체 판단용)
+        scores_to_save = df_sorted_slim[["Ticker", "Score", "affordability_filter_requested"]].rename(columns={"Ticker": "ticker", "Score": "score_total"})
+        scores_to_save["updated_at"] = fixed_date
+        scores_to_save.to_json(scores_json, orient="records", indent=2, force_ascii=False)
+
+        # 메타(생성시각/마켓/스키마) + 파라미터 일부 기록
+        meta_payload = {
+            "generated_at": generated_at,
+            "market": market,
+            "schema_version": SCHEMA_VERSION,
+            "date": fixed_date,
+            "params": {
+                "min_history_bars": int(screener_params.get("min_history_bars", 200)),
+                "pykrx_sector_min_missing": int(screener_params.get("pykrx_sector_min_missing", 5)),
+                "affordability_filter_requested": aff_req,
+            },
+            "files": {
+                "rank_full": str(rank_full_json.name),
+                "rank": str(rank_slim_json.name),
+                "candidates_full": str(cands_full_json.name),
+                "candidates": str(cands_slim_json.name),
+                "scores": str(scores_json.name),
+            },
+        }
+        try:
+            with open(meta_json, "w", encoding="utf-8") as f:
+                json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+            logger.info("메타 저장: %s", meta_json)
+        except Exception as e:
+            logger.warning("메타 저장 실패: %s", e)
 
         logger.info("전체 랭킹(풀) 저장: %s", rank_full_json)
         logger.info("전체 랭킹(슬림) 저장: %s", rank_slim_json)
         logger.info("최종 후보(풀) 저장: %s", cands_full_json)
         logger.info("✅ 스크리닝 완료. 후보(슬림) 저장: %s", cands_slim_json)
+        logger.info("스코어 캐시 저장: %s", scores_json)
 
-        # 디스코드 요약 알림(상위 5개)
         try:
             top5 = final_candidates_slim.head(5)[["Ticker", "Name", "Sector", "Price", "목표가", "손절가", "Score"]]
             lines = ["Top5:"]

@@ -358,7 +358,7 @@ if __name__ == "__main__":
     _startup_banner()
 
     logger.info("스케줄러가 시작되었습니다. 다음 작업 대기 중...")
-    # run_trading_pipeline()  # 즉시 테스트용
+    #run_trading_pipeline()  # 즉시 테스트용
 
     while True:
         schedule.run_pending()

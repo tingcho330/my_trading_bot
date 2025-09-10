@@ -1,14 +1,17 @@
 # src/utils.py
 import os
 import json
-import time
+import time as pytime   # ← 모듈 time 충돌 방지
 import logging
+import math
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Union
-from datetime import datetime
+from datetime import datetime, time as dt_time  # ← datetime.time 별칭
 from zoneinfo import ZoneInfo
 import threading
 import re
+import pandas as pd
+
 
 # ────────────────────────────────
 # 공개 심볼 (다른 모듈에서 무엇을 가져갈지 명시)
@@ -20,12 +23,19 @@ __all__ = [
     "CONFIG_PATH",
     "setup_logging",
     "load_config",
+    "get_cfg",
+    "compute_52w_position",
+    "compute_kki_metrics",
+    "count_consecutive_up",
+    "is_newly_listed",
+    "in_time_windows",
     "is_market_open_day",
     "find_latest_file",
     "cache_save",
     "cache_load",
     "load_account_files_with_retry",
     "extract_cash_from_summary",
+    "_to_int_krw",  # ← 공개 심볼 추가
     # 추가: 계좌 스냅샷 캐시 프로바이더 & 호가 유틸
     "get_account_snapshot_cached",
     "get_tick_size",
@@ -71,12 +81,11 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
             h.setFormatter(fmt)
             h.setLevel(level)
 
-    # noisy 네트워크 로깅 차단: httpx/httpcore/urllib3가 INFO 로그를 뿌리며
-    # DiscordLogHandler로 재전송되는 루프를 방지
+    # noisy 네트워크 로깅 차단
     for noisy in ("httpx", "httpcore", "urllib3"):
         lg = logging.getLogger(noisy)
-        lg.setLevel(logging.WARNING)   # INFO 이하 무시
-        lg.propagate = False           # 상위(루트) 전파 금지
+        lg.setLevel(logging.WARNING)
+        lg.propagate = False
 
     root.debug(
         "logging initialized (KST). OUTPUT_DIR=%s, CACHE_DIR=%s, CONFIG_PATH=%s",
@@ -87,11 +96,10 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     return root
 
 # ────────────────────────────────
-# 설정 파일 로더
+# 설정 파일 및 데이터 분석 유틸리티
 # ────────────────────────────────
-def load_config() -> Optional[Dict[str, Any]]:
+def load_config(path: Path = CONFIG_PATH) -> Optional[Dict[str, Any]]:
     logger = logging.getLogger(__name__)
-    path = CONFIG_PATH
     try:
         if not path.exists():
             logger.error("설정 파일을 찾을 수 없습니다: %s", path)
@@ -107,6 +115,139 @@ def load_config() -> Optional[Dict[str, Any]]:
         logger.error("설정 파일 읽기 실패(%s): %s", path, e)
         return None
 
+def get_cfg(path: Path = CONFIG_PATH) -> dict:
+    """설정 로드 + 기본값 보정 + 유효성 검사"""
+    logger = logging.getLogger(__name__)
+    cfg = load_config(path)
+    if cfg is None:
+        logger.warning("get_cfg: 설정 로드에 실패하여 기본값으로 진행합니다.")
+        cfg = {}  # Fallback to an empty dict
+        
+    s = cfg.get("screener_params", {})
+    s.setdefault("max_market_cap", int(1e13))
+    s.setdefault("vol_kki_weight", 0.10)
+    s.setdefault("pos_52w_weight", 0.05)
+    s.setdefault("exclude_newly_listed_days", 60)
+    s.setdefault("exclude_consecutive_up_days", 3)
+    cfg.setdefault("trading_guards", {"min_cash_to_trade": 120000, "auto_shrink_slots": True})
+    cfg.setdefault("prompting", {"core_questions": True})
+    cfg.setdefault("rotation", {"enabled": True, "delta_score_min": 0.10})
+    return cfg
+
+def compute_52w_position(series: pd.Series) -> float:
+    """52주 범위에서 현재 위치(0~1). 데이터 결측/분모 0은 0 처리"""
+    if series is None or series.empty:
+        return 0.0
+    high_52 = series[-252:].max()
+    low_52 = series[-252:].min()
+    last = series.iloc[-1]
+    rng = max(1e-9, (high_52 - low_52))
+    pos = (last - low_52) / rng
+    return float(max(0.0, min(1.0, pos)))
+
+def compute_kki_metrics(df: pd.DataFrame) -> float:
+    """
+    '끼' 점수(0~1): 60D 수익률 표준편차 정규화 + 1Y 상한가 빈도
+    df: 반드시 'close','open','high','low' 포함, 일자 오름차순
+    """
+    if df is None or df.empty:
+        return 0.0
+    # ← 컬럼 케이스 보정(호출부 무관하게 동작)
+    df = df.rename(columns=str.lower)
+    if any(c not in df.columns for c in ["close", "open", "high", "low"]):
+        return 0.0
+
+    rets = df["close"].pct_change()
+    vol = rets.rolling(60).std().iloc[-1]
+    # z-score를 간단히 0~3 범위에 맵핑(로버스트 클립)
+    if pd.isna(vol):
+        vol_norm = 0.0
+    else:
+        vol_norm = min(3.0, max(0.0, (vol / (rets.std() + 1e-9)))) / 3.0
+    # 1Y 상한가 빈도(보수적 근사: 1.29배)
+    year = df.tail(252)
+    prev_close = year["close"].shift(1)
+    limit_hits = ((year["high"] >= prev_close * 1.29).fillna(False)).sum()
+    limit_freq = min(1.0, limit_hits / 252.0)
+    return float(max(0.0, min(1.0, 0.7 * vol_norm + 0.3 * limit_freq)))
+
+def count_consecutive_up(df: pd.DataFrame, window: int = 3) -> int:
+    """연속 양봉 수(마지막 날 기준)"""
+    if df is None or df.empty:
+        return 0
+    up = (df["close"] > df["open"]).astype(int)
+    cnt = 0
+    for v in reversed(up.tolist()):
+        if v == 1:
+            cnt += 1
+        else:
+            break
+    return cnt
+
+def is_newly_listed(listing_date: datetime, today: datetime, limit_days: int) -> bool:
+    if listing_date is None:
+        return False
+    return (today.date() - listing_date.date()).days < limit_days
+
+#
+# ────────────────────────────────
+# 시간창 포함 여부 체크 (형식 검증 + 자정 교차 구간 지원)
+# ────────────────────────────────
+_WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
+
+def _parse_hhmm(hh: str, mm: str) -> dt_time:
+    """'HH','MM' 숫자 문자열을 datetime.time으로 안전 변환(범위 보정 포함)."""
+    h = max(0, min(23, int(hh)))
+    m = max(0, min(59, int(mm)))
+    return dt_time(h, m)
+
+def in_time_windows(
+    now: datetime,
+    windows: Optional[List[str]] = None,
+    tz: Optional[ZoneInfo] = None,
+) -> bool:
+    """
+    주어진 시각(now)이 'HH:MM-HH:MM' 형태의 구간 리스트 중 하나라도 포함되면 True
+    - 잘못된 포맷은 무시하고 경고 로그를 남깁니다
+    - 시작 > 종료 인 구간은 '자정 교차(cross-midnight)' 구간으로 해석합니다
+      예) 23:50-00:10 → 23:50~24:00 또는 00:00~00:10
+    - windows가 비어있거나 None이면 '제한 없음'으로 간주하여 True를 반환합니다
+    """
+    logger = logging.getLogger(__name__)
+
+    # 타임존 보정: naive → 지정 tz로 로컬라이즈, aware → tz로 변환
+    if tz is not None:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=tz)
+        else:
+            now = now.astimezone(tz)
+
+    # 제한 구간이 없으면 통과 (기본 허용)
+    if not windows:
+        return True
+
+    hm = now.time()
+    for raw in windows:
+        if not isinstance(raw, str):
+            logger.warning("in_time_windows: 잘못된 항목(문자열 아님) 무시: %r", raw)
+            continue
+        m = _WINDOW_RE.match(raw)
+        if not m:
+            logger.warning("in_time_windows: 포맷 불일치 'HH:MM-HH:MM' 무시: %s", raw)
+            continue
+        s = _parse_hhmm(m.group(1), m.group(2))
+        e = _parse_hhmm(m.group(3), m.group(4))
+
+        if s <= e:
+            # 일반 구간: s <= hm <= e
+            if s <= hm <= e:
+                return True
+        else:
+            # 자정 교차 구간: s..24:00 또는 00:00..e
+            if hm >= s or hm <= e:
+                return True
+    return False
+
 # ────────────────────────────────
 # 장 개장일 체크 (간단: 주말 제외)
 # ────────────────────────────────
@@ -116,14 +257,10 @@ def is_market_open_day() -> bool:
 
 # ────────────────────────────────
 # 내부: 파일명에서 날짜/시장/런ID 추출
-#   지원 예시:
-#     screener_candidates_full_20250903_KOSPI.json
-#     gpt_trades_20250904-134000.json
-#     balance_20250904.json, summary_20250904.json
 # ────────────────────────────────
 _date_patterns = [
-    re.compile(r"(?P<date>\d{8})[._-]?(?P<hms>\d{6})?"),      # 20250904 or 20250904-134000
-    re.compile(r"(?P<date>\d{8})"),                           # 20250904
+    re.compile(r"(?P<date>\d{8})[._-]?(?P<hms>\d{6})?"),  # 20250904 or 20250904-134000
+    re.compile(r"(?P<date>\d{8})"),                       # 20250904
 ]
 _market_pattern = re.compile(r"(KOSPI|KOSDAQ|KONEX|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)", re.IGNORECASE)
 
@@ -188,12 +325,9 @@ def find_latest_file(
 ) -> Optional[Path]:
     """
     OUTPUT_DIR에서 patterns에 매칭되는 파일 중 '최신' 하나를 반환합니다.
-    - patterns: 문자열 패턴 또는 패턴 리스트/튜플 (e.g. "gpt_trades_*.json" or ["screener_candidates_full_*_*.json", "screener_rank_full_*_*.json"])
+    - patterns: 문자열 패턴 또는 패턴 리스트/튜플
     - market: "KOSPI" 등 필터(대소문자 무시). 파일명에 시장명이 포함된 경우에만 필터 적용.
-    - prefer_date_over_mtime: 파일명에 날짜가 있으면 (YYYYMMDD, optional HHMMSS) 우선,
-      날짜 동일/부재 시 mtime으로 결정.
-
-    주의: 이전 버전은 단일 패턴 + mtime 기준이었으나, 하위 호환을 위해 단일 패턴도 허용합니다.
+    - prefer_date_over_mtime: 파일명 날짜 우선, 동일/부재시 mtime 기준.
     """
     logger = logging.getLogger(__name__)
     candidates = _iter_globs(patterns)
@@ -212,15 +346,16 @@ def find_latest_file(
         filtered.append((score, p))
 
     if not filtered:
-        # 마켓 필터로 모두 제외되었을 수 있으니, 경고 로그 후 전체에서 mtime 기준 fallback
-        logger.debug("find_latest_file: market=%s 필터로 후보가 비어 fallback(mtime) 실행", mkt or "NONE")
+        logger.debug(
+            "find_latest_file: 후보 없음 → fallback(mtime). market_filter=%s, patterns=%s",
+            mkt or "NONE", patterns,
+        )
         try:
             return max(candidates, key=lambda x: x.stat().st_mtime)
         except Exception:
             return None
 
     # 날짜/시간/mtime 우선 순위 정렬
-    # (date, hms, mtime)를 키로 하여 가장 큰 값을 선택
     latest = max(filtered, key=lambda t: t[0])[1]
     return latest
 
@@ -304,13 +439,13 @@ def load_account_files_with_retry(
     파일 생성 직후일 수 있어 최대 max_wait_sec 동안 재시도.
     """
     logger = logging.getLogger(__name__)
-    deadline = time.time() + max_wait_sec
+    deadline = pytime.time() + max_wait_sec
     summary_path: Optional[Path] = None
     balance_path: Optional[Path] = None
     parsed_summary: Dict[str, str] = {}
     parsed_balance: List[Dict] = []
 
-    while time.time() < deadline:
+    while pytime.time() < deadline:
         if summary_path is None:
             summary_path = find_latest_file(summary_pattern)
         if balance_path is None:
@@ -329,7 +464,7 @@ def load_account_files_with_retry(
 
         if ok:
             return parsed_summary, parsed_balance, summary_path, balance_path
-        time.sleep(0.5)
+        pytime.sleep(0.5)
 
     # 마지막 시도
     if summary_path and summary_path.exists() and not parsed_summary:
@@ -371,13 +506,13 @@ def extract_cash_from_summary(summary_dict: Dict[str, str]) -> Dict[str, int]:
 # ────────────────────────────────
 _SNAPSHOT_CACHE_LOCK = threading.Lock()
 _SNAPSHOT_CACHE: Dict[str, Any] = {
-    "ts": 0.0,                # 캐시 생성 시각 (epoch)
-    "summary_path": None,     # 마지막 사용 summary 파일 경로
-    "balance_path": None,     # 마지막 사용 balance 파일 경로
-    "summary_mtime": 0.0,     # summary 파일 mtime
-    "balance_mtime": 0.0,     # balance 파일 mtime
-    "summary": {},            # 파싱된 summary
-    "balance": [],            # 파싱된 balance
+    "ts": 0.0,                  # 캐시 생성 시각 (epoch)
+    "summary_path": None,       # 마지막 사용 summary 파일 경로
+    "balance_path": None,       # 마지막 사용 balance 파일 경로
+    "summary_mtime": 0.0,       # summary 파일 mtime
+    "balance_mtime": 0.0,       # balance 파일 mtime
+    "summary": {},              # 파싱된 summary
+    "balance": [],              # 파싱된 balance
 }
 _SNAPSHOT_LOCKFILE = Path(os.getenv("ACCOUNT_SNAPSHOT_LOCK", "/tmp/account_snapshot.lock"))
 _SNAPSHOT_TTL_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_TTL_SEC", "90"))  # 기본 90초
@@ -394,7 +529,7 @@ def _files_unchanged(summary_path: Optional[Path], balance_path: Optional[Path],
 
 def _touch_lockfile() -> None:
     try:
-        _SNAPSHOT_LOCKFILE.write_text(str(time.time()))
+        _SNAPSHOT_LOCKFILE.write_text(str(pytime.time()))
     except Exception:
         pass
 
@@ -402,7 +537,7 @@ def _lock_is_recent(max_age_sec: int = 10) -> bool:
     try:
         if not _SNAPSHOT_LOCKFILE.exists():
             return False
-        age = time.time() - _SNAPSHOT_LOCKFILE.stat().st_mtime
+        age = pytime.time() - _SNAPSHOT_LOCKFILE.stat().st_mtime
         return age <= max_age_sec
     except Exception:
         return False
@@ -423,12 +558,12 @@ def get_account_snapshot_cached(
     ttl = int(ttl_sec if ttl_sec is not None else _SNAPSHOT_TTL_SEC)
 
     # 1) 락 파일이 최신이라면 잠깐 대기(중복 IO 억제)
-    wait_deadline = time.time() + _SNAPSHOT_WAIT_ON_LOCK_SEC
-    while _lock_is_recent() and time.time() < wait_deadline:
-        time.sleep(0.2)
+    wait_deadline = pytime.time() + _SNAPSHOT_WAIT_ON_LOCK_SEC
+    while _lock_is_recent() and pytime.time() < wait_deadline:
+        pytime.sleep(0.2)
 
     with _SNAPSHOT_CACHE_LOCK:
-        now = time.time()
+        now = pytime.time()
         # 캐시가 유효하면 그대로 반환
         if (now - _SNAPSHOT_CACHE["ts"]) <= ttl:
             # 파일 변경 없는지 확인
@@ -493,8 +628,8 @@ def round_to_tick(price: float, mode: str = "nearest") -> int:
     """
     호가단위에 맞춰 반올림.
       - mode='nearest' (기본): 가장 가까운 호가
-      - mode='down'          : 아래 호가
-      - mode='up'            : 위 호가
+      - mode='down'         : 아래 호가
+      - mode='up'           : 위 호가
     """
     try:
         p = float(price)

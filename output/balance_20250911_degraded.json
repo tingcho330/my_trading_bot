@@ -1,0 +1,15 @@
+{
+  "comments": {
+    "pdno": "종목코드 (예: 005930 = 삼성전자)",
+    "prdt_name": "종목명",
+    "hldg_qty": "보유수량",
+    "pchs_avg_pric": "평균매입단가",
+    "prpr": "현재가",
+    "evlu_amt": "평가금액",
+    "evlu_pfls_amt": "평가손익 금액",
+    "evlu_pfls_rt": "평가손익률 (%)"
+  },
+  "data": [],
+  "status": "degraded",
+  "status_reason": "HTTPSConnectionPool(host='openapi.koreainvestment.com', port=9443): Max retries exceeded with url: /uapi/domestic-stock/v1/trading/inquire-balance?CANO=73507211&ACNT_PRDT_CD=01&AFHR_FLPR_YN=N&OFL_YN=&INQR_DVSN=02&UNPR_DVSN=01&FUND_STTL_ICLD_YN=N&FNCG_AMT_AUTO_RDPT_YN=N&PRCS_DVSN=00&CTX_AREA_FK100=&CTX_AREA_NK100= (Caused by NameResolutionError(\"<urllib3.connection.HTTPSConnection object at 0xffff5"
+}

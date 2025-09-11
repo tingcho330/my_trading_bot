@@ -1,0 +1,18 @@
+{
+  "generated_at": "2025-09-11T13:04:53.355113+09:00",
+  "market": "KOSPI",
+  "schema_version": "1.2",
+  "date": "20250911",
+  "params": {
+    "min_history_bars": 200,
+    "pykrx_sector_min_missing": 100,
+    "affordability_filter_requested": true
+  },
+  "files": {
+    "rank_full": "screener_rank_full_20250911_KOSPI.json",
+    "rank": "screener_rank_20250911_KOSPI.json",
+    "candidates_full": "screener_candidates_full_20250911_KOSPI.json",
+    "candidates": "screener_candidates_20250911_KOSPI.json",
+    "scores": "screener_scores_20250911_KOSPI.json"
+  }
+}

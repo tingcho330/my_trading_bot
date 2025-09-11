@@ -1,0 +1,270 @@
+diff --git a/config/config.json b/tmp/config.json.new
+index 9b160b6..e02c2bd 100644
+--- a/config/config.json
++++ b/tmp/config.json.new
+@@ -1,175 +1,90 @@
+-diff --git a/config/config.json b/config/config.json
+-index 1111111..2222222 100644
+---- a/config/config.json
+-+++ b/config/config.json
+-@@ -1,60 +1,110 @@
+--{
+--  "trading_environment": "prod",
+--  "screener_params": {
+--    "min_market_cap": 500000000000,
+--    "min_trading_value_5d_avg": 40000000000,
+--    "top_n": 20,
+--    "fin_weight": 0.2,
+--    "tech_weight": 0.5,
+--    "mkt_weight": 0.1,
+--    "sector_weight": 0.2,
+--    "pattern_weight": 0.1,
+--    "sector_cap": 0.3,
+--    "sector_source_priority": ["kis", "pykrx"]
+--  },
+--  "risk_params": {
+--    "max_positions": 8,
+--    "cooldown_period_days": 10,
+--    "atr_period": 14,
+--    "atr_k_stop": 1.5,
+--    "swing_lookback": 20,
+--    "reward_risk": 2.0,
+--    "stop_pct": 0.03
+--  },
+--  "gpt_params": {
+--    "openai_model": "gpt-4o-mini",
+--    "strategy_weights": {
+--      "RsiReversalStrategy": 0.6,
+--      "TrendFollowingStrategy": 0.8,
+--      "AdvancedTechnicalStrategy": 0.6,
+--      "DynamicAtrStrategy": 0.7,
+--      "BaseStrategy": 0.5
+--    }
+--  },
+--  "strategy_params": {
+--    "stop_loss_pct": 0.05,
+--    "take_profit_pct": 0.10,
+--    "atr_k_stop": 2.0,
+--    "atr_k_profit": 4.0,
+--    "weights": {
+--      "RsiReversalStrategy": 0.5,
+--      "TrendFollowingStrategy": 0.8,
+--      "AdvancedTechnicalStrategy": 0.6,
+--      "DynamicAtrStrategy": 0.7
+--    },
+--    "sell_threshold": 1.0
+--  },
+--  "trading_params": {
+--    "max_positions": 8,
+--    "allow_rebuy": true,
+--    "max_legs_per_ticker": 2,
+--    "per_ticker_max_weight": 0.25,
+--    "min_order_cash": 100000,
+--    "rebuy_atr_k": 0.5,
+--    "rebuy_rsi_ceiling": 72.0
+--  },
+--  "notifications": {
+--    "discord_cooldown_sec": 60,
+--    "snapshot_change_threshold_pct": 1.0
+--  }
+--}
+-+{
+-+  "trading_environment": "prod",
+-+  "screener_params": {
+-+    "min_market_cap": 200000000000,
+-+    "min_trading_value_5d_avg": 15000000000,
+-+    "top_n": 20,
+-+    "fin_weight": 0.25,
+-+    "tech_weight": 0.3,
+-+    "mkt_weight": 0.15,
+-+    "sector_weight": 0.15,
+-+    "pattern_weight": 0.1,
+-+    "sector_cap": 0.3,
+-+    "sector_source_priority": [
+-+      "kis",
+-+      "pykrx"
+-+    ],
+-+    "max_market_cap": 10000000000000,
+-+    "vol_kki_weight": 0.1,
+-+    "pos_52w_weight": 0.05,
+-+    "exclude_newly_listed_days": 60,
+-+    "exclude_consecutive_up_days": 3
+-+  },
+-+  "risk_params": {
+-+    "max_positions": 8,
+-+    "cooldown_period_days": 10,
+-+    "atr_period": 14,
+-+    "atr_k_stop": 1.5,
+-+    "swing_lookback": 20,
+-+    "reward_risk": 2.0,
+-+    "stop_pct": 0.03
+-+  },
+-+  "gpt_params": {
+-+    "openai_model": "gpt-4o-mini",
+-+    "strategy_weights": {
+-+      "RsiReversalStrategy": 0.6,
+-+      "TrendFollowingStrategy": 0.8,
+-+      "AdvancedTechnicalStrategy": 0.6,
+-+      "DynamicAtrStrategy": 0.7,
+-+      "BaseStrategy": 0.5
+-+    }
+-+  },
+-+  "strategy_params": {
+-+    "stop_loss_pct": 0.041,
+-+    "take_profit_pct": 0.11,
+-+    "atr_k_stop": 2.0,
+-+    "atr_k_profit": 4.0,
+-+    "weights": {
+-+      "RsiReversalStrategy": 0.5,
+-+      "TrendFollowingStrategy": 0.8,
+-+      "AdvancedTechnicalStrategy": 0.6,
+-+      "DynamicAtrStrategy": 0.7
+-+    },
+-+    "sell_threshold": 1.0,
+-+    "regime": {
+-+      "hot": {
+-+        "vol_kki_weight": 0.15,
+-+        "pos_52w_weight": 0.1
+-+      },
+-+      "cold": {
+-+        "vol_kki_weight": 0.05,
+-+        "pos_52w_weight": 0.03
+-+      }
+-+    },
+-+    "sell_rules": {
+-+      "prev_close_break": {
+-+        "enabled": true,
+-+        "buffer_pct": 0.004,
+-+        "confirm_bars": 1,
+-+        "active_time": [
+-+          "09:30-11:00",
+-+          "14:00-15:10"
+-+        ]
+-+      }
+-+    },
+-+    "pyramiding": {
+-+      "enabled": true,
+-+      "only_if_profit_pct": 0.02,
+-+      "steps": [
+-+        0.5,
+-+        0.33
+-+      ],
+-+      "max_total_position_pct": 0.2,
+-+      "cooldown_bars": 3
+-+    }
+-+  },
+-+  "trading_params": {
+-+    "max_positions": 8,
+-+    "allow_rebuy": true,
+-+    "max_legs_per_ticker": 2,
+-+    "per_ticker_max_weight": 0.25,
+-+    "min_order_cash": 100000,
+-+    "rebuy_atr_k": 0.5,
+-+    "rebuy_rsi_ceiling": 72.0
+-+  },
+-+  "notifications": {
+-+    "discord_cooldown_sec": 60,
+-+    "snapshot_change_threshold_pct": 1.0
+-+  },
+-+  "trading_guards": {
+-+    "min_cash_to_trade": 120000,
+-+    "auto_shrink_slots": true
+-+  },
+-+  "prompting": {
+-+    "core_questions": true
+-+  },
+-+  "rotation": {
+-+    "enabled": true,
+-+    "delta_score_min": 0.1
+-+  }
+-+}
++{
++  "trading_environment": "prod",
++  "screener_params": {
++    "min_market_cap": 200000000000,
++    "min_trading_value_5d_avg": 15000000000,
++    "top_n": 20,
++    "fin_weight": 0.25,
++    "tech_weight": 0.3,
++    "mkt_weight": 0.15,
++    "sector_weight": 0.15,
++    "pattern_weight": 0.1,
++    "sector_cap": 0.3,
++    "sector_source_priority": ["kis","pykrx"],
++    "max_market_cap": 10000000000000,
++    "vol_kki_weight": 0.1,
++    "pos_52w_weight": 0.05,
++    "exclude_newly_listed_days": 60,
++    "exclude_consecutive_up_days": 3
++  },
++  "risk_params": {
++    "max_positions": 8,
++    "cooldown_period_days": 10,
++    "atr_period": 14,
++    "atr_k_stop": 1.5,
++    "swing_lookback": 20,
++    "reward_risk": 2.0,
++    "stop_pct": 0.03
++  },
++  "gpt_params": {
++    "openai_model": "gpt-4o-mini",
++    "strategy_weights": {
++      "RsiReversalStrategy": 0.6,
++      "TrendFollowingStrategy": 0.8,
++      "AdvancedTechnicalStrategy": 0.6,
++      "DynamicAtrStrategy": 0.7,
++      "BaseStrategy": 0.5
++    }
++  },
++  "strategy_params": {
++    "stop_loss_pct": 0.041,
++    "take_profit_pct": 0.11,
++    "atr_k_stop": 2.0,
++    "atr_k_profit": 4.0,
++    "weights": {
++      "RsiReversalStrategy": 0.5,
++      "TrendFollowingStrategy": 0.8,
++      "AdvancedTechnicalStrategy": 0.6,
++      "DynamicAtrStrategy": 0.7
++    },
++    "sell_threshold": 1.0,
++    "regime": {
++      "hot": { "vol_kki_weight": 0.15, "pos_52w_weight": 0.10 },
++      "cold": { "vol_kki_weight": 0.05, "pos_52w_weight": 0.03 }
++    },
++    "sell_rules": {
++      "prev_close_break": {
++        "enabled": true,
++        "buffer_pct": 0.004,
++        "confirm_bars": 1,
++        "active_time": ["09:30-11:00","14:00-15:10"]
++      }
++    },
++    "pyramiding": {
++      "enabled": true,
++      "only_if_profit_pct": 0.02,
++      "steps": [0.5, 0.33],
++      "max_total_position_pct": 0.20,
++      "cooldown_bars": 3
++    }
++  },
++  "trading_params": {
++    "max_positions": 8,
++    "allow_rebuy": true,
++    "max_legs_per_ticker": 2,
++    "per_ticker_max_weight": 0.25,
++    "min_order_cash": 100000,
++    "rebuy_atr_k": 0.5,
++    "rebuy_rsi_ceiling": 72.0
++  },
++  "notifications": {
++    "discord_cooldown_sec": 60,
++    "snapshot_change_threshold_pct": 1.0
++  },
++  "trading_guards": {
++    "min_cash_to_trade": 120000,
++    "auto_shrink_slots": true
++  },
++  "prompting": { "core_questions": true },
++  "rotation": { "enabled": true, "delta_score_min": 0.10 }
++}

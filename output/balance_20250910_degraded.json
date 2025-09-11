@@ -1,0 +1,22 @@
+{
+  "comments": {
+    "pdno": "종목코드 (예: 005930 = 삼성전자)",
+    "prdt_name": "종목명",
+    "hldg_qty": "보유수량",
+    "pchs_avg_pric": "평균매입단가",
+    "prpr": "현재가",
+    "evlu_amt": "평가금액",
+    "evlu_pfls_amt": "평가손익 금액",
+    "evlu_pfls_rt": "평가손익률 (%)"
+  },
+  "data": [
+    {
+      "rt_cd": "0",
+      "msg_cd": "KIOK0510",
+      "msg1": "조회가 완료되었습니다                                                           ",
+      "status_code": 200
+    }
+  ],
+  "status": "degraded",
+  "status_reason": "조회가 완료되었습니다                                                           "
+}

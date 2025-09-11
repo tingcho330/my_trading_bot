@@ -1,0 +1,34 @@
+{
+  "034230": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "006260": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "034220": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "003490": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "004020": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "001440": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "249420": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  },
+  "010620": {
+    "status": "ERROR",
+    "text": "[ERROR] 뉴스 수집 중 오류 발생"
+  }
+}

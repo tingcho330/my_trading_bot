@@ -1,0 +1,29 @@
+{
+  "ts": "20250910-141300",
+  "meta": {
+    "rt_cd": "0",
+    "msg_cd": "KIOK0510",
+    "msg1": "조회가 완료되었습니다                                                           ",
+    "status_code": 200
+  },
+  "balance": {
+    "columns": [
+      "rt_cd",
+      "msg_cd",
+      "msg1",
+      "status_code"
+    ],
+    "head": [
+      {
+        "rt_cd": "0",
+        "msg_cd": "KIOK0510",
+        "msg1": "조회가 완료되었습니다                                                           ",
+        "status_code": 200
+      }
+    ]
+  },
+  "summary": {
+    "columns": [],
+    "head": []
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "comments": {
+    "dnca_tot_amt": "예수금 총액",
+    "prvs_rcdl_excc_amt": "D+2 출금 가능 금액",
+    "nxdy_excc_amt": "익일(D+1) 출금 가능 금액",
+    "tot_evlu_amt": "총 평가 금액 (주식 평가금 + 예수금)",
+    "pchs_amt_smtl_amt": "매입 금액 합계",
+    "evlu_pfls_smtl_amt": "평가 손익 합계",
+    "status": "데이터 상태 (ok/degraded)",
+    "status_reason": "degraded 사유(있을 때)"
+  },
+  "data": [],
+  "status": "degraded",
+  "status_reason": "조회가 완료되었습니다                                                           "
+}

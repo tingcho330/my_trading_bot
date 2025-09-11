@@ -1,0 +1,14 @@
+{
+  "comments": {
+    "dnca_tot_amt": "예수금 총액",
+    "prvs_rcdl_excc_amt": "D+2 출금 가능 금액",
+    "nxdy_excc_amt": "익일(D+1) 출금 가능 금액",
+    "tot_evlu_amt": "총 평가 금액 (주식 평가금 + 예수금)",
+    "pchs_amt_smtl_amt": "매입 금액 합계",
+    "evlu_pfls_smtl_amt": "평가 손익 합계",
+    "status": "데이터 상태 (ok/degraded)"
+  },
+  "data": [],
+  "status": "degraded",
+  "status_reason": "HTTPSConnectionPool(host='openapi.koreainvestment.com', port=9443): Max retries exceeded with url: /uapi/domestic-stock/v1/trading/inquire-balance?CANO=73507211&ACNT_PRDT_CD=01&AFHR_FLPR_YN=N&OFL_YN=&INQR_DVSN=02&UNPR_DVSN=01&FUND_STTL_ICLD_YN=N&FNCG_AMT_AUTO_RDPT_YN=N&PRCS_DVSN=00&CTX_AREA_FK100=&CTX_AREA_NK100= (Caused by NameResolutionError(\"<urllib3.connection.HTTPSConnection object at 0xffff5"
+}

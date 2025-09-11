@@ -5,6 +5,7 @@ import random
 import time
 import subprocess
 import sys
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from collections import defaultdict
@@ -42,6 +43,11 @@ from notifier import (
 setup_logging()
 logger = logging.getLogger("trader")
 
+def logj(level: str, **kv):
+    """구조화(JSON) 라인 로깅"""
+    line = json.dumps(kv, ensure_ascii=False, separators=(",", ":"))
+    getattr(logger, level, logger.info)(line)
+
 # 루트 로거에 디스코드 에러 핸들러 장착(중복 방지)
 _root = logging.getLogger()
 if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
@@ -51,9 +57,10 @@ if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
 else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
-# ── 간단 레이트 리밋(스팸 방지) ───────────────────────────────────────
+# ── 간단 레이트 리밋/중복 억제 ───────────────────────────────────────
 _last_sent_ts = defaultdict(float)
 DEFAULT_COOLDOWN_SEC = 120  # 동일 키 알림 최소 간격(초)
+_last_payload_seen_ts: Dict[str, float] = {}  # 페이로드 해시 중복 억제(5분)
 
 def _can_send(key: str, cooldown: int = DEFAULT_COOLDOWN_SEC) -> bool:
     now = time.time()
@@ -62,23 +69,45 @@ def _can_send(key: str, cooldown: int = DEFAULT_COOLDOWN_SEC) -> bool:
         return True
     return False
 
+def _dedup_payload(payload: str, window_sec: int = 300) -> bool:
+    """같은 페이로드가 window_sec 내 반복되면 차단. True=보내도 됨."""
+    now = time.time()
+    h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    ts = _last_payload_seen_ts.get(h, 0.0)
+    if now - ts <= window_sec:
+        return False
+    _last_payload_seen_ts[h] = now
+    return True
+
 def _scope_key_with_run_id(key: str) -> str:
     """key 가 'run:'으로 시작하지 않으면 RUN_ID 네임스페이스를 앞에 붙인다."""
     if key.startswith("run:"):
         return key
     return f"run:{os.getenv('RUN_ID', 'na')}:{key}"
 
-def _notify_text(content: str, key: str = "trader_generic", cooldown: int = DEFAULT_COOLDOWN_SEC):
+def _notify_text(content: str, key: str = "trader_generic", cooldown: int = DEFAULT_COOLDOWN_SEC, dedup: bool = True):
     key = _scope_key_with_run_id(key)
-    if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL) and _can_send(key, cooldown):
+    if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
+        return
+    if dedup and not _dedup_payload(f"text:{content}"):
+        return
+    if _can_send(key, cooldown):
         try:
             send_discord_message(content=content)
         except Exception:
             pass
 
-def _notify_embed(embed: Dict, key: str, cooldown: int = DEFAULT_COOLDOWN_SEC):
+def _notify_embed(embed: Dict, key: str, cooldown: int = DEFAULT_COOLDOWN_SEC, dedup: bool = True):
     key = _scope_key_with_run_id(key)
-    if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL) and _can_send(key, cooldown):
+    if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
+        return
+    try:
+        payload = json.dumps(embed, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        payload = str(embed)
+    if dedup and not _dedup_payload(f"embed:{payload}"):
+        return
+    if _can_send(key, cooldown):
         try:
             send_discord_message(embeds=[embed])
         except Exception:
@@ -157,15 +186,20 @@ class Trader:
         self.allow_rebuy = bool(self.trading_params.get("allow_rebuy", False))
         self.max_positions = int(self.trading_params.get("max_positions", self.risk_params.get("max_positions", 5)))
         self.max_legs_per_ticker = int(self.trading_params.get("max_legs_per_ticker", 1))
-        self.per_ticker_max_weight = float(self.trading_params.get("per_ticker_max_weight", 1.0))
+        # 설정값 범위 클램프
+        self.per_ticker_max_weight = max(0.05, min(0.5, float(self.trading_params.get("per_ticker_max_weight", 1.0))))
         self.min_order_cash = int(self.trading_params.get("min_order_cash", 0))
         self.rebuy_atr_k = float(self.trading_params.get("rebuy_atr_k", 0.0))
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
-        self.cash_buffer_ratio = float(self.trading_params.get("cash_buffer_ratio", 0.0))
+        self.cash_buffer_ratio = max(0.0, min(0.5, float(self.trading_params.get("cash_buffer_ratio", 0.0))))
+
+        # 분할 매수 설정(P1)
+        self.split_cfg = (self.trading_params.get("split_buy") or {})
+        self.split_enabled = bool(self.split_cfg.get("enabled", False))
 
         self.cooldown_list = self._load_cooldown_list()
-        self.cooldown_period_days = self.risk_params.get("cooldown_period_days", 10)
+        self.cooldown_period_days = int(self.risk_params.get("cooldown_period_days", 10))
 
         # 쿨다운: 연속 실패 카운트(메모리), 임계치
         self._fail_counts = defaultdict(int)
@@ -182,6 +216,9 @@ class Trader:
         notif_cfg = self.settings.get("notifications", {}) or {}
         self._account_update_min_interval = float(notif_cfg.get("discord_cooldown_sec", 60))
         self._last_account_update_ts = 0.0
+
+        # 시세 캐시(P0)
+        self._price_cache: Dict[str, Tuple[float, int]] = {}  # {ticker: (ts, price)}
 
         # 요약/통계
         self.stats = {"buy": 0, "sell": 0, "hold": 0}
@@ -210,6 +247,21 @@ class Trader:
             f" Trader 초기화 완료 (env={self.env}, real_trading={self.is_real_trading}, run_id={self.run_id})",
             key=f"phase:init:{self.run_id}", cooldown=60
         )
+
+    # ── 시세 캐시 ─────────────────────────────────────────────────────
+    def _get_price_cached(self, ticker: str, ttl_sec: float = 2.0) -> int:
+        now = time.time()
+        ts, px = self._price_cache.get(ticker, (0.0, 0))
+        if now - ts <= ttl_sec and px > 0:
+            return px
+        try:
+            df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
+            px = _to_int(df['stck_prpr'].iloc[0]) if (df is not None and not df.empty) else 0
+        except Exception:
+            px = 0
+        if px > 0:
+            self._price_cache[ticker] = (now, px)
+        return px
 
     # ── 스크리너 전체 데이터 로드 ──────────────────────────────────────
     def _load_all_stock_data(self) -> Dict[str, Dict]:
@@ -283,7 +335,7 @@ class Trader:
             for attempt in range(2):
                 try:
                     subprocess.run(
-                        ["python", str(ACCOUNT_SCRIPT_PATH)],
+                        [sys.executable, str(ACCOUNT_SCRIPT_PATH)],  # P0: 인터프리터 고정
                         capture_output=True, text=True, check=True, encoding="utf-8",
                         timeout=60
                     )
@@ -329,6 +381,11 @@ class Trader:
             if str(h.get("pdno", "")).zfill(6) == ticker:
                 return _to_int(h.get("hldg_qty", 0))
         return 0
+
+    @staticmethod
+    def _get_qty_map(holdings: List[Dict]) -> Dict[str, int]:
+        """보유수량 조회 O(1)용 맵"""
+        return {str(h.get("pdno", "")).zfill(6): _to_int(h.get("hldg_qty", 0)) for h in holdings}
 
     def _portfolio_snapshot(self, holdings: List[Dict]) -> Dict[str, Any]:
         by_val: Dict[str, float] = defaultdict(float)
@@ -460,20 +517,22 @@ class Trader:
 
     def _order_cash_retry(self, max_retries: int = 3, backoff_base: float = 0.5, **kwargs) -> Dict[str, Any]:
         backoff = backoff_base
+        kwargs = dict(kwargs)  # P0: 인자 오염 방지
         last_res = None
         for attempt in range(1, max_retries + 1):
             res = self._order_cash_safe(**kwargs)
             last_res = res
             if res.get('ok'):
                 return res
-            # 가격대역/호가 오류 → 1회 가격 보정 재시도
+            # 가격대역/호가 오류 → 1회 가격 보정 재시도 (시장가는 제외)
             msg = (res.get('msg1') or '').lower()
             if attempt == 1 and any(k in msg for k in ['상한', '하한', 'price band', '가격제한', '호가']):
                 try:
+                    ord_dvsn = kwargs.get('ord_dvsn')  # '01'이면 시장가
                     ou = int(kwargs.get('ord_unpr', '0'))
-                    if kwargs.get('ord_dv') == '02':  # 매수
+                    if kwargs.get('ord_dv') == '02' and ord_dvsn != '01':  # 매수, 지정가
                         ou = max(1, ou - get_tick_size(ou))
-                    elif kwargs.get('ord_dv') == '01':  # 매도
+                    elif kwargs.get('ord_dv') == '01' and ord_dvsn != '01':  # 매도, 지정가
                         ou = ou + get_tick_size(ou)
                     kwargs['ord_unpr'] = str(ou)
                     continue  # 즉시 다음 루프(보정 가격으로 재시도)
@@ -482,8 +541,8 @@ class Trader:
             if not self._is_transient_error(res):
                 return res
             if attempt < max_retries:
-                time.sleep(backoff)
-                backoff *= 2
+                time.sleep(backoff + random.uniform(0, backoff/2))  # 지터
+                backoff = min(backoff * 2, 3.0)  # 상한
         return last_res if last_res is not None else {'ok': False, 'rt_cd': None, 'msg1': 'no result'}
 
     # ── 쿨다운 보조: 연속 실패 누적 후에만 등록 ───────────────────────
@@ -500,6 +559,18 @@ class Trader:
             # 등록 후 카운트 리셋
             self._fail_counts[ticker] = 0
 
+    # ── 포지션 변화 대기(P1: 폴링 기반) ───────────────────────────────
+    def _wait_for_position_change(self, ticker: str, pre_qty: int, timeout: float = 6.0, interval: float = 0.6) -> int:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self._update_account_info(force=True)
+            _, h, _ = self._load_snapshot()
+            post = self._get_qty(h, ticker)
+            if post != pre_qty:
+                return post
+            time.sleep(interval)
+        return pre_qty
+
     # ── 공용 시장가 매도 (리밸런싱 등) ────────────────────────────────
     def _execute_market_sell(self, ticker: str, quantity: int, name: str, reason_text: str, reason_code: str = "REBALANCE_SWAP") -> Dict[str, Any]:
         if quantity <= 0:
@@ -508,24 +579,20 @@ class Trader:
         logger.info(f"[REBALANCE] 매도 실행: {name}({ticker}) {quantity}주 | 사유={reason_text}")
 
         if self.is_real_trading:
-            pre_qty = quantity
+            # 실제 보유 수량 스냅샷(P1)
+            _, holdings_before, _ = self._load_snapshot()
+            pre_qty = self._get_qty(holdings_before, ticker)
 
             result = self._order_cash_retry(
                 ord_dv="01", pdno=ticker, ord_dvsn="01", ord_qty=str(quantity), ord_unpr="0"
             )
 
-            time.sleep(2)
-            self._update_account_info(force=True)
-            _, holdings_after, _ = self._load_snapshot()
-            post_qty = self._get_qty(holdings_after, ticker)
+            # 폴링 기반 체결 확인(P1)
+            post_qty = self._wait_for_position_change(ticker, pre_qty, timeout=6.0, interval=0.6)
             filled_qty = max(0, pre_qty - post_qty)
 
-            # 체결가 근사(시세 조회 실패 시 0 허용)
-            try:
-                price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                current_price = _to_int(price_df['stck_prpr'].iloc[0]) if (price_df is not None and not price_df.empty) else 0
-            except Exception:
-                current_price = 0
+            # 체결가 근사(시세 캐시)
+            current_price = self._get_price_cached(ticker)
 
             # 결과 기록 및 쿨다운 처리
             if result.get('ok') or filled_qty > 0:
@@ -549,10 +616,7 @@ class Trader:
                     "strategy_details": {"reason": reason_text, "reason_code": reason_code, "broker_msg": result.get('msg1')}
                 }), key=f"phase:rebalance_sell:{ticker}:{self.run_id}", cooldown=30)
 
-                # ✅ 매도 통계 반영
                 self.stats["sell"] += 1
-
-                # 응답 실패지만 체결 확인 포함 → 쿨다운 금지 & 실패 카운터 리셋
                 self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=False)
                 return {"status": "executed", "filled_qty": filled_qty, "rt_cd": result.get('rt_cd'), "msg1": result.get('msg1')}
             else:
@@ -576,7 +640,6 @@ class Trader:
                     "strategy_details": {"error": err, "reason_code": reason_code}
                 }), key=f"phase:rebalance_sell_fail:{ticker}:{self.run_id}", cooldown=30)
 
-                # 연속 실패 누적 → 기준치 도달 시에만 쿨다운
                 self._maybe_add_cooldown(ticker, "리밸런스 매도 주문 실패", increment_fail=True)
                 return {"status": "sell_fail", "filled_qty": 0, "rt_cd": result.get('rt_cd'), "msg1": result.get('msg1')}
         else:
@@ -591,7 +654,6 @@ class Trader:
                 f" [모의] REBALANCE SELL {name}({ticker}) x{quantity}",
                 key=f"phase:paper_rebalance_sell:{ticker}:{self.run_id}", cooldown=30
             )
-            # ✅ 매도 통계 반영(모의)
             self.stats["sell"] += 1
             return {"status": "executed", "filled_qty": quantity, "rt_cd": "0", "msg1": "paper"}
 
@@ -702,14 +764,13 @@ class Trader:
                 sell_res = self._execute_market_sell(wt, wqty, wname, reason_text=f"REBALANCE_SWAP → {ct}", reason_code="REBALANCE_SWAP")
                 if sell_res.get("status") != "executed":
                     logger.info(f"[ROTATION] SELL 확정 실패 → BUY 스킵 (pair {wt}->{ct})")
-                    # 실패 누적은 _execute_market_sell 내부에서 처리
                     continue
 
                 # 동일 티커 반복 SELL 방지
                 self._sold_once.add(wt)
 
                 # 매도 후 스냅샷 강제 갱신 → 최신 현금으로 BUY 판단
-                time.sleep(3)
+                time.sleep(0.6)
                 self._update_account_info(force=True)
                 new_cash, new_holdings, _ = self._load_snapshot()
 
@@ -718,6 +779,120 @@ class Trader:
                 return bool(bought)
 
         return False
+
+    # ── 분할 계획(P1) ────────────────────────────────────────────────
+    def _build_split_plan(self, budget:int, base_price:int, tick:int) -> List[Tuple[int,int]]:
+        """
+        budget(원)과 base_price, tick을 받아 (price, qty) 슬라이스 리스트 반환.
+        - weights, ladder_ticks 반영
+        - 각 슬라이스가 min_cash_per_slice 미만이면 보정/병합
+        - 총액이 budget을 넘지 않도록 조정
+        """
+        cfg = self.split_cfg
+        slices = max(1, int(cfg.get("slices", 3)))
+        weights = cfg.get("weights") or [1.0/slices]*slices
+        ladder = cfg.get("ladder_ticks") or [0]*slices
+        assert len(weights) == slices and len(ladder) == slices
+
+        wsum = sum(weights) or 1.0
+        weights = [w/wsum for w in weights]
+        min_cash = int(cfg.get("min_cash_per_slice", max(self.min_order_cash, 0)))
+
+        plan: List[Tuple[int,int]] = []
+        remaining = budget
+        for i in range(slices):
+            price = round_to_tick(base_price + ladder[i]*tick, mode="up")
+            alloc  = int(budget * weights[i])
+            alloc  = min(alloc, remaining)
+            qty    = 0 if price <= 0 else alloc // price
+            # 최소 주문 금액 보장
+            if qty > 0 and price*qty < min_cash:
+                needed_qty = (min_cash + price - 1)//price
+                if needed_qty*price <= remaining:
+                    qty = needed_qty
+                else:
+                    qty = 0
+            if qty > 0:
+                cost = price*qty
+                plan.append((price, qty))
+                remaining -= cost
+
+        # 남은 예산을 첫 슬라이스에 얹어서 낭비 최소화
+        if remaining >= min_cash and plan:
+            p0, q0 = plan[0]
+            add_qty = remaining // p0
+            if add_qty > 0:
+                plan[0] = (p0, q0 + add_qty)
+                remaining -= add_qty*p0
+        return plan
+
+    def _execute_split_buy(self, name:str, ticker:str, budget:int, current_price:int, batch_name:str="SPLIT") -> bool:
+        if budget <= 0 or current_price <= 0:
+            return False
+        tick = get_tick_size(current_price)
+        plan = self._build_split_plan(budget, current_price, tick)
+        if not plan:
+            logger.info(f"[{batch_name}] 분할 계획 없음(예산/최소주문 불충족): {name}({ticker})")
+            return False
+
+        group_id = f"{self.run_id}:{ticker}:{int(time.time())}"
+        any_ok = False
+        for idx, (price, qty) in enumerate(plan, start=1):
+            logger.info(f"[{batch_name}] BUY-slice {idx}/{len(plan)} {name}({ticker}) x{qty} @ {price:,}")
+            if self.is_real_trading:
+                # 슬라이스별 사전 보유량
+                _, h_before, _ = self._load_snapshot()
+                pre_qty = self._get_qty(h_before, ticker)
+
+                res = self._order_cash_retry(ord_dv="02", pdno=ticker, ord_dvsn="00",
+                                             ord_qty=str(qty), ord_unpr=str(int(price)))
+                if res.get("ok"):
+                    post_qty = self._wait_for_position_change(ticker, pre_qty, timeout=5.0, interval=0.5)
+                    filled = max(0, post_qty - pre_qty)
+                    self._update_account_info(force=True)
+                    record_trade({
+                        "side":"buy","ticker":ticker,"name":name,"qty":filled if filled>0 else qty,"price":price,
+                        "trade_status":"completed" if filled>0 else "submitted",
+                        "strategy_details":{"broker_msg":res.get('msg1'),
+                        "batch":batch_name,"slice_seq":idx,"group_id":group_id}
+                    })
+                    self.stats["buy"] += 1
+                    _notify_embed(create_trade_embed({
+                        "side":"BUY","name":name,"ticker":ticker,"qty":filled if filled>0 else qty,"price":price,
+                        "trade_status":"completed" if filled>0 else "submitted",
+                        "strategy_details":{"broker_msg":res.get('msg1'),"batch":batch_name,"slice_seq":idx,"group_id":group_id}
+                    }), key=f"phase:buy_split_ok:{ticker}:{self.run_id}", cooldown=20)
+                    any_ok = True
+                    self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
+                else:
+                    err = res.get('msg1','Unknown error')
+                    record_trade({
+                        "side":"buy","ticker":ticker,"name":name,"qty":qty,"price":price,
+                        "trade_status":"failed","strategy_details":{"error":err,"batch":batch_name,
+                        "slice_seq":idx,"group_id":group_id}
+                    })
+                    _notify_embed(create_trade_embed({
+                        "side":"BUY","name":name,"ticker":ticker,"qty":qty,"price":price,
+                        "trade_status":"failed","strategy_details":{"error":err,"batch":batch_name,
+                        "slice_seq":idx,"group_id":group_id}
+                    }), key=f"phase:buy_split_fail:{ticker}:{self.run_id}", cooldown=20)
+                    self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=True)
+            else:
+                record_trade({
+                    "side":"buy","ticker":ticker,"name":name,"qty":qty,"price":price,
+                    "trade_status":"completed","strategy_details":{"batch":batch_name,
+                    "slice_seq":idx,"group_id":group_id}
+                })
+                self.stats["buy"] += 1
+                _notify_text(f" [모의] BUY-slice {idx} {name}({ticker}) x{qty} @ {price:,}",
+                             key=f"phase:paper_buy_split:{ticker}:{self.run_id}", cooldown=15)
+
+            # 슬라이스 간 인터벌
+            interval = float(self.split_cfg.get("interval_sec", 0.6))
+            jitter   = float(self.split_cfg.get("jitter_sec", 0.15))
+            time.sleep(max(0.0, interval + random.uniform(-jitter, jitter)))
+
+        return any_ok
 
     # ── 단일 매수 실행(회전/특수 케이스용) ────────────────────────────
     def _execute_buy_single(self, stock_info: Dict[str, Any], available_cash: int, batch_name: str = "SINGLE") -> bool:
@@ -733,15 +908,10 @@ class Trader:
             logger.info(f"[{batch_name}] 예산 부족으로 매수 불가: {name}({ticker}), budget={budget:,}")
             return False
 
-        # 현재가 조회 (실패 시 stock_info 가격 사용)
+        # 현재가 조회 (캐시 우선)
         current_price = _to_int(stock_info.get("Price", 0))
         if current_price <= 0:
-            try:
-                price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                    current_price = _to_int(price_df['stck_prpr'].iloc[0])
-            except Exception:
-                current_price = 0
+            current_price = self._get_price_cached(ticker)
         if current_price <= 0:
             logger.info(f"[{batch_name}] 현재가 조회 실패: {name}({ticker})")
             return False
@@ -749,65 +919,75 @@ class Trader:
         tick = get_tick_size(current_price)
         raw_price = current_price + (tick * random.randint(1, 3))
         order_price = round_to_tick(raw_price, mode="up")
-        qty = int(budget // order_price)
+        qty_budget = int(budget // order_price)
 
-        # 최소 주문 금액 판정은 **금액 기준**으로 (주가와 비교 ❌)
-        if qty <= 0 or (self.min_order_cash > 0 and (qty * order_price) < self.min_order_cash):
-            logger.info(f"[{batch_name}] 예산/최소주문 조건 불충족: {name}({ticker}) qty={qty}, "
-                        f"price={order_price:,}, spent={qty*order_price:,}, min_order_cash={self.min_order_cash:,}")
+        # 최소 주문 금액 판정은 **금액 기준**
+        if qty_budget <= 0 or (self.min_order_cash > 0 and (qty_budget * order_price) < self.min_order_cash):
+            logger.info(f"[{batch_name}] 예산/최소주문 조건 불충족: {name}({ticker}) qty={qty_budget}, "
+                        f"price={order_price:,}, spent={qty_budget*order_price:,}, min_order_cash={self.min_order_cash:,}")
             return False
 
-        logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty} @ {order_price:,}")
+        # 분할 매수 스위치(P1)
+        if self.split_enabled and qty_budget >= int(self.split_cfg.get("min_qty", 250)):
+            used = int(min(budget, qty_budget * order_price))
+            return self._execute_split_buy(name, ticker, used, current_price, batch_name=f"{batch_name}_SPLIT")
+
+        logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty_budget} @ {order_price:,}")
 
         if self.is_real_trading:
+            # 사전 보유량
+            _, h_before, _ = self._load_snapshot()
+            pre_qty = self._get_qty(h_before, ticker)
+
             res = self._order_cash_retry(
-                ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(qty), ord_unpr=str(int(order_price))
+                ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(qty_budget), ord_unpr=str(int(order_price))
             )
-            time.sleep(2)
             if not res.get("ok"):
                 err = res.get("msg1", "Unknown error")
                 record_trade({
                     "side": "buy", "ticker": ticker, "name": name,
-                    "qty": qty, "price": order_price, "trade_status": "failed",
+                    "qty": qty_budget, "price": order_price, "trade_status": "failed",
                     "strategy_details": {"error": err, "batch": batch_name}
                 })
                 _notify_embed(create_trade_embed({
                     "side": "BUY", "name": name, "ticker": ticker,
-                    "qty": qty, "price": order_price, "trade_status": "failed",
+                    "qty": qty_budget, "price": order_price, "trade_status": "failed",
                     "strategy_details": {"error": err, "batch": batch_name}
                 }), key=f"phase:buy_fail:{ticker}:{self.run_id}", cooldown=30)
-                # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                 self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=True)
                 return False
 
-            # ✅ 성공 경로에서만 계좌 갱신
+            # 폴링 기반 체결 확인(P1)
+            post_qty = self._wait_for_position_change(ticker, pre_qty, timeout=6.0, interval=0.6)
+            qty_delta = max(0, post_qty - pre_qty)
+
             self._update_account_info(force=True)
             record_trade({
                 "side": "buy", "ticker": ticker, "name": name,
-                "qty": qty, "price": order_price, "trade_status": "submitted",
+                "qty": qty_delta if qty_delta > 0 else qty_budget, "price": order_price,
+                "trade_status": "completed" if qty_delta > 0 else "submitted",
                 "strategy_details": {"broker_msg": res.get('msg1'), "batch": batch_name}
             })
             _notify_embed(create_trade_embed({
                 "side": "BUY", "name": name, "ticker": ticker,
-                "qty": qty, "price": order_price, "trade_status": "submitted",
+                "qty": qty_delta if qty_delta > 0 else qty_budget, "price": order_price,
+                "trade_status": "completed" if qty_delta > 0 else "submitted",
                 "strategy_details": {"broker_msg": res.get('msg1'), "batch": batch_name}
             }), key=f"phase:buy_success:{ticker}:{self.run_id}", cooldown=30)
-            # ✅ 매수 통계 반영(성공/제출 시)
+
             self.stats["buy"] += 1
-            # 성공 시 실패카운트 리셋
             self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
             return True
         else:
             record_trade({
                 "side": "buy", "ticker": ticker, "name": name,
-                "qty": qty, "price": order_price, "trade_status": "completed",
+                "qty": qty_budget, "price": order_price, "trade_status": "completed",
                 "strategy_details": {"batch": batch_name}
             })
             _notify_text(
-                f" [모의] BUY {name}({ticker}) x{qty} @ {order_price:,} [{batch_name}]",
+                f" [모의] BUY {name}({ticker}) x{qty_budget} @ {order_price:,} [{batch_name}]",
                 key=f"phase:paper_buy_single:{ticker}:{self.run_id}", cooldown=30
             )
-            # ✅ 매수 통계 반영(모의)
             self.stats["buy"] += 1
             return True
 
@@ -854,13 +1034,7 @@ class Trader:
 
             # 실시간 레벨/RSI/Price 오버레이
             try:
-                cur_price = 0
-                try:
-                    price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                    if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                        cur_price = _to_int(price_df['stck_prpr'].iloc[0])
-                except Exception:
-                    cur_price = 0
+                cur_price = self._get_price_cached(ticker)
                 if cur_price <= 0:
                     cur_price = _to_int(stock_info.get("Price", 0))
                 if cur_price > 0:
@@ -891,23 +1065,18 @@ class Trader:
             executed_sell = True
 
             if self.is_real_trading:
-                pre_qty = self._get_qty(holdings, ticker)
+                # 사전 보유량
+                qty_map = self._get_qty_map(holdings)
+                pre_qty = qty_map.get(ticker, 0)
 
                 result = self._order_cash_retry(
                     ord_dv="01", pdno=ticker, ord_dvsn="01", ord_qty=str(quantity), ord_unpr="0"
                 )
 
-                time.sleep(2)
-                self._update_account_info(force=True)
-                _, holdings_after, _ = self._load_snapshot()
-                post_qty = self._get_qty(holdings_after, ticker)
+                post_qty = self._wait_for_position_change(ticker, pre_qty, timeout=6.0, interval=0.6)
                 filled_qty = max(0, pre_qty - post_qty)
 
-                try:
-                    price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                    current_price = _to_int(price_df['stck_prpr'].iloc[0]) if (price_df is not None and not price_df.empty) else 0
-                except Exception:
-                    current_price = 0
+                current_price = self._get_price_cached(ticker)
 
                 parent_trade_id = None
                 pnl_amount = None
@@ -945,14 +1114,8 @@ class Trader:
                         }
                     }), key=f"phase:sell:{ticker}:{self.run_id}", cooldown=30)
 
-                    # ✅ 매도 통계 반영
                     self.stats["sell"] += 1
-
-                    # 성공/체결확인 → 실패카운트 리셋
                     self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=False)
-
-                    if filled_qty == 0:
-                        logger.info("  -> 응답은 성공이나 즉시 체결 없음(미체결 가능). submitted로 기록.")
                 else:
                     err = result.get('msg1', 'Unknown error')
                     record_trade({
@@ -973,7 +1136,6 @@ class Trader:
                         "qty": quantity, "price": current_price, "trade_status": "failed",
                         "strategy_details": {"error": err, "reason_code": reason_code}
                     }), key=f"phase:sell_fail:{ticker}:{self.run_id}", cooldown=30)
-                    # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                     self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=True)
 
             else:
@@ -988,12 +1150,10 @@ class Trader:
                     f" [모의] SELL {name}({ticker}) x{quantity} | {reason_code}",
                     key=f"phase:paper_sell:{ticker}:{self.run_id}", cooldown=30
                 )
-                # ✅ 매도 통계 반영(모의)
                 self.stats["sell"] += 1
                 self._add_to_cooldown(ticker, "모의 매도 완료")
 
         if executed_sell:
-            time.sleep(5)
             self._update_account_info(force=True)
 
     # ── (도우미) 현금 기반 슬롯 계산 ──────────────────────────────────
@@ -1032,7 +1192,6 @@ class Trader:
             logger.info("매수 계획 파일(gpt_trades_*.json)이 없어 매수를 건너뜁니다.")
             _notify_text("ℹ️ gpt_trades 파일 없음 → 매수 스킵",
                          key=f"phase:no_trades:{self.run_id}", cooldown=600)
-            # gpt 트레이드가 없어도 리밸런스는 동작하도록 진행(신규 타겟은 all_stock_data 기반)
         else:
             with open(trade_plan_file, 'r', encoding='utf-8') as f:
                 trade_plans = json.load(f)
@@ -1064,7 +1223,7 @@ class Trader:
                 return
             else:
                 # 회전 성공 시 현금/보유 최신화 후 계속 신규/추가 매수 진행
-                time.sleep(3)
+                time.sleep(0.6)
                 self._update_account_info(force=True)
                 available_cash, holdings, _ = self._load_snapshot()
                 # 슬롯 재계산
@@ -1133,12 +1292,7 @@ class Trader:
 
                 current_price = _to_int(info.get("Price", 0))
                 if current_price == 0:
-                    try:
-                        price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                        if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                            current_price = _to_int(price_df['stck_prpr'].iloc[0])
-                    except Exception:
-                        current_price = 0
+                    current_price = self._get_price_cached(ticker)
                     if current_price == 0:
                         logger.info(f"  -> [{name}({ticker})] 현재가 조회 실패. 매수를 건너뜁니다.")
                         _notify_embed(create_trade_embed({
@@ -1170,21 +1324,35 @@ class Trader:
                     }), key=f"phase:buy_insufficient:{ticker}:{self.run_id}", cooldown=120)
                     continue
 
-                pre_qty = 0  # 신규/리밸런스에서는 0 기준
                 logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,.0f}원 [{batch_name}]")
 
                 if self.is_real_trading:
+                    # 사전 보유량
+                    _, h_before, _ = self._load_snapshot()
+                    pre_qty = self._get_qty(h_before, ticker)
+
+                    # 분할 매수 스위치
+                    if self.split_enabled and quantity >= int(self.split_cfg.get("min_qty", 250)):
+                        used = int(min(budget_for_this_stock, quantity * order_price))
+                        ok = self._execute_split_buy(name, ticker, used, current_price, batch_name=f"{batch_name}_SPLIT")
+                        if ok:
+                            self._update_account_info(force=True)
+                            new_cash, _, _ = self._load_snapshot()
+                            remaining_cash = new_cash
+                            any_order_placed = True
+                        else:
+                            logger.info(f"[{batch_name}] 분할 매수 실패/스킵: {name}({ticker})")
+                        continue  # 분할이면 단일주문 생략
+
                     result = self._order_cash_retry(
                         ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(quantity), ord_unpr=str(int(order_price))
                     )
 
                     if result.get('ok'):
-                        time.sleep(2)
-                        # ✅ 성공 경로에서만 계좌 갱신/체결수 확인
+                        post_qty = self._wait_for_position_change(ticker, pre_qty, timeout=6.0, interval=0.6)
+                        qty_delta = max(0, post_qty - pre_qty)
                         self._update_account_info(force=True)
                         new_cash, holdings_after, _ = self._load_snapshot()
-                        post_qty = self._get_qty(holdings_after, ticker)
-                        qty_delta = max(0, post_qty - pre_qty)
 
                         # ✅ 매수 통계 반영
                         self.stats["buy"] += 1
@@ -1206,7 +1374,6 @@ class Trader:
                             "price": order_price, "trade_status": trade_status,
                             "strategy_details": {"broker_msg": result.get('msg1'), "batch": batch_name}
                         }), key=f"phase:buy_success:{ticker}:{self.run_id}", cooldown=30)
-                        # 성공/체결확인 → 실패 카운트 리셋
                         self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
                     else:
                         err = result.get('msg1', 'Unknown error')
@@ -1228,13 +1395,11 @@ class Trader:
                             "price": order_price, "trade_status": "failed",
                             "strategy_details": {"error": err, "reason_code": "BROKER_REJECT", "batch": batch_name}
                         }), key=f"phase:buy_fail:{ticker}:{self.run_id}", cooldown=30)
-                        # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                         self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=True)
                 else:
                     actual_spent = quantity * order_price
                     remaining_cash -= actual_spent
                     any_order_placed = True
-                    # ✅ 매수 통계 반영(모의)
                     self.stats["buy"] += 1
                     record_trade({
                         "side": "buy", "ticker": ticker, "name": name,
@@ -1302,17 +1467,17 @@ class Trader:
                 else:
                     _notify_text(f" 리밸런싱 매도 {len(to_sell_list)}건 실행", key=f"phase:rebalance_sell_batch:{self.run_id}", cooldown=120)
                     for s in to_sell_list:
-                        sell_res = self._execute_market_sell(
+                        _ = self._execute_market_sell(
                             ticker=s["ticker"],
                             quantity=s["qty"],
                             name=s["name"],
                             reason_text=f"REBALANCE_SWAP (old={s['old_score']:.3f} → new={s['new_score']:.3f} for {s['new_ticker']})",
                             reason_code="REBALANCE_SWAP"
                         )
-                        time.sleep(0.5)
+                        time.sleep(0.3)
 
                     # 매도 후 최신 잔고/현금 재조회 및 슬롯 재계산
-                    time.sleep(3)
+                    time.sleep(0.6)
                     self._update_account_info(force=True)
                     new_cash, holdings_after, _ = self._load_snapshot()
                     eff_now = self._compute_effective_slots(new_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
@@ -1338,7 +1503,6 @@ class Trader:
                 _execute_buy_batch(targets_to_buy, batch_name="NEW")
 
         if any_order_placed:
-            time.sleep(5)
             self._update_account_info(force=True)
 
     # ── 리밸런싱 페어링 (점수 기반 + Δscore 임계치) ───────────────────
@@ -1361,7 +1525,7 @@ class Trader:
         if not held:
             return [], []
 
-        # 신규 후보: (score, plan) — gpt 기반이 없으면 all_stock_data 상위 점수를 사용
+        # 신규 후보: (score, plan) — gpt 기반이 없으면 all_stock_data 상위 점수 사용
         new_list: List[Tuple[float, Dict]] = []
         if new_targets:
             for plan in new_targets:
@@ -1369,7 +1533,6 @@ class Trader:
                 sc = _to_float(info.get("Score"), 0.0)
                 new_list.append((float(sc), plan))
         else:
-            # all_stock_data에서 점수 높은 상위 후보 구성
             tmp = []
             for t, rec in self.all_stock_data.items():
                 sc = _to_float(rec.get("Score"), 0.0)
@@ -1382,8 +1545,8 @@ class Trader:
         if not new_list:
             return [], []
 
-        held_sorted = sorted(held, key=lambda x: x[3])              # 점수 오름차순(최약체 우선)
-        new_sorted = sorted(new_list, key=lambda x: x[0], reverse=True)  # 후보 고점수 우선
+        held_sorted = sorted(held, key=lambda x: x[3])                    # 점수 오름차순(최약체 우선)
+        new_sorted = sorted(new_list, key=lambda x: x[0], reverse=True)   # 후보 고점수 우선
 
         delta_thr = float(self.settings.get("rotation", {}).get("delta_score_min", 0.10))
 
@@ -1395,7 +1558,7 @@ class Trader:
             if hi >= len(held_sorted):
                 break
             worst_t, worst_name, worst_qty, worst_score, worst_pr = held_sorted[hi]
-            if new_score >= (worst_score + delta_thr):  # ✅ Δscore 임계치 적용
+            if new_score >= (worst_score + delta_thr):  # Δscore 임계치
                 info = plan.get("stock_info", {})
                 to_buy.append(plan)
                 to_sell.append({
@@ -1409,7 +1572,6 @@ class Trader:
                 })
                 hi += 1
             else:
-                # 임계치 못 넘으면 더 이상 교체 진행 X (보수적)
                 break
 
         if to_buy and to_sell:
@@ -1440,11 +1602,13 @@ class Trader:
 
     def _save_cooldown_list(self):
         COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(COOLDOWN_FILE, 'w', encoding='utf-8') as f:
+        tmp = COOLDOWN_FILE.with_suffix(".tmp")
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(self.cooldown_list, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, COOLDOWN_FILE)  # P0: 원자적 저장
 
     def _add_to_cooldown(self, ticker: str, reason: str):
-        end_date = (datetime.now() + timedelta(days=self.cooldown_period_days)).isoformat()
+        end_date = (datetime.now(KST) + timedelta(days=self.cooldown_period_days)).isoformat()  # P0: KST
         self.cooldown_list[ticker] = end_date
         self._save_cooldown_list()
         logger.info(f"[{ticker}] {reason}으로 인해 쿨다운 목록에 추가. ({end_date}까지)")
@@ -1455,7 +1619,7 @@ class Trader:
         if ticker not in self.cooldown_list:
             return False
         cooldown_end_date = datetime.fromisoformat(self.cooldown_list[ticker])
-        if datetime.now() < cooldown_end_date:
+        if datetime.now(KST) < cooldown_end_date:  # P0: KST
             return True
         else:
             del self.cooldown_list[ticker]

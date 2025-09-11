@@ -208,7 +208,7 @@ class Trader:
 
         _notify_text(
             f" Trader 초기화 완료 (env={self.env}, real_trading={self.is_real_trading}, run_id={self.run_id})",
-            key="phase:init", cooldown=60
+            key=f"phase:init:{self.run_id}", cooldown=60
         )
 
     # ── 스크리너 전체 데이터 로드 ──────────────────────────────────────
@@ -228,7 +228,7 @@ class Trader:
         if not picked:
             logger.info("스크리너 결과 파일을 찾지 못했습니다. (candidates_full/rank_full/candidates)")
             _notify_text("ℹ️ 스크리너 전체 데이터 없음 -> 실시간 조회로 진행",
-                         key="phase:load_full_missing", cooldown=600)
+                         key=f"phase:load_full_missing:{self.run_id}", cooldown=600)
             return {}
 
         try:
@@ -266,7 +266,7 @@ class Trader:
         except (IOError, json.JSONDecodeError) as e:
             logger.error(f"{picked.name} 파일 로드 실패: {e}")
             _notify_text(f"⚠️ 스크리너 데이터 로드 실패: {e}",
-                         key="phase:load_full_error", cooldown=600)
+                         key=f"phase:load_full_error:{self.run_id}", cooldown=600)
             return {}
 
     # ── account.py 트리거 ────────────────────────────────────────────
@@ -289,7 +289,7 @@ class Trader:
                     )
                     logger.info("[RET] account.py 실행 완료.")
                     _notify_text(" account.py 실행 완료(요약/잔고 갱신)",
-                                 key="phase:account_update", cooldown=60)
+                                 key=f"phase:account_update:{self.run_id}", cooldown=60)
                     break
                 except subprocess.TimeoutExpired:
                     logger.error("account.py 타임아웃(60s). 재시도 중...")
@@ -303,11 +303,11 @@ class Trader:
         except FileNotFoundError:
             msg = f"스크립트를 찾을 수 없습니다: {ACCOUNT_SCRIPT_PATH}"
             logger.error(msg)
-            _notify_text(f"❗ {msg}", key="phase:account_not_found", cooldown=300)
+            _notify_text(f"❗ {msg}", key=f"phase:account_not_found:{self.run_id}", cooldown=300)
         except Exception as e:
             msg = f"계좌 정보 업데이트 중 예외: {e}"
             logger.error(msg, exc_info=True)
-            _notify_text(f"❗ {msg}", key="phase:account_exc", cooldown=300)
+            _notify_text(f"❗ {msg}", key=f"phase:account_exc:{self.run_id}", cooldown=300)
 
     # ── 스냅샷 로더/헬퍼 ──────────────────────────────────────────────
     def _load_snapshot(self) -> Tuple[int, List[Dict], Dict[str, int]]:
@@ -401,36 +401,60 @@ class Trader:
 
     # ── 주문 안전 래퍼 ────────────────────────────────────────────────
     def _order_cash_safe(self, **kwargs) -> Dict[str, Any]:
+        """
+        kis.order_cash() 응답 형태 다양성(DataFrame/dict/str/예외)을 안전하게 표준화.
+        반환 키: ok, rt_cd, msg_cd, msg1, http_status, raw, df(optional)
+        """
         try:
-            df = self.kis.order_cash(**kwargs)
-            if df is None or df.empty:
-                return {'ok': False, 'rt_cd': None, 'msg_cd': None, 'msg1': 'API 응답 없음', 'http_status': None}
-            rec = df.to_dict('records')[0]
-            rt_cd = rec.get('rt_cd', '')
-            ok = (rt_cd == '0')  # 표준 성공 판정
-            return {
-                'ok': ok,
-                'rt_cd': rt_cd,
-                'msg_cd': rec.get('msg_cd'),
-                'msg1': rec.get('msg1', '메시지 없음'),
-                'http_status': rec.get('status_code'),
-                'raw': rec,
-                'df': df,
-            }
+            res = self.kis.order_cash(**kwargs)
+            # 1) DataFrame 성공 경로
+            if hasattr(res, "empty"):
+                if res is None or res.empty:
+                    return {'ok': False, 'rt_cd': None, 'msg_cd': None, 'msg1': 'API 응답 없음', 'http_status': None, 'raw': None}
+                rec = res.to_dict('records')[0]
+                rt_cd = rec.get('rt_cd', '')
+                ok = (rt_cd == '0')
+                return {
+                    'ok': ok, 'rt_cd': rt_cd, 'msg_cd': rec.get('msg_cd'),
+                    'msg1': rec.get('msg1', '메시지 없음'),
+                    'http_status': rec.get('status_code'),
+                    'raw': rec, 'df': res
+                }
+            # 2) dict/obj 경로(에러 시 ‘output’ 없음)
+            if isinstance(res, dict):
+                raw_json = json.dumps(res, ensure_ascii=False)[:800]
+                rt_cd = str(res.get('rt_cd', 'EXC'))
+                msg_cd = res.get('msg_cd')
+                msg1  = res.get('msg1') or res.get('error') or '주문 실패(비표준 응답)'
+                ok = (rt_cd == '0')
+                return {
+                    'ok': ok, 'rt_cd': rt_cd, 'msg_cd': msg_cd, 'msg1': msg1,
+                    'http_status': res.get('status_code'), 'raw': raw_json
+                }
+            # 3) 기타: 문자열 등
+            raw_str = str(res)[:800]
+            return {'ok': False, 'rt_cd': 'EXC', 'msg_cd': None, 'msg1': '예상치 못한 응답형태', 'http_status': None, 'raw': raw_str}
         except Exception as e:
+            em = str(e)
+            if "'output'" in em:
+                # KIS 오류 포맷에서 output 미존재 → 브로커 거절 케이스로 간주
+                return {'ok': False, 'rt_cd': 'EXC', 'msg_cd': None, 'msg1': "브로커 거절(응답에 output 없음)", 'http_status': None, 'error': em}
             logger.error(f"주문 API 호출 중 예외 발생: {e}", exc_info=True)
-            return {'ok': False, 'rt_cd': 'EXC', 'msg_cd': None, 'msg1': str(e), 'http_status': None, 'error': str(e)}
+            return {'ok': False, 'rt_cd': 'EXC', 'msg_cd': None, 'msg1': em, 'http_status': None, 'error': em}
 
     @staticmethod
     def _is_transient_error(result: Dict[str, Any]) -> bool:
         msg = (result.get('msg1') or '').lower()
         status = result.get('http_status')
-        # 5xx, 네트워크, 게이트웨이/서비스 불가, 일시 오류
-        hints = [
-            'timeout', 'timed out', 'temporarily', '일시', 'too many requests',
-            'service unavailable', 'bad gateway', 'gateway', '네트워크', 'api 응답 없음'
-        ]
+        hints = ['timeout','timed out','temporarily','일시','too many requests',
+                 'service unavailable','bad gateway','gateway','네트워크',
+                 'api 응답 없음','overload','busy']
+        rt_cd = str(result.get('rt_cd', '')).strip()
         if isinstance(status, int) and 500 <= status < 600:
+            return True
+        if isinstance(status, int) and status in (408, 429):
+            return True
+        if rt_cd in {'-1','8'}:
             return True
         return any(h in msg for h in hints)
 
@@ -442,6 +466,19 @@ class Trader:
             last_res = res
             if res.get('ok'):
                 return res
+            # 가격대역/호가 오류 → 1회 가격 보정 재시도
+            msg = (res.get('msg1') or '').lower()
+            if attempt == 1 and any(k in msg for k in ['상한', '하한', 'price band', '가격제한', '호가']):
+                try:
+                    ou = int(kwargs.get('ord_unpr', '0'))
+                    if kwargs.get('ord_dv') == '02':  # 매수
+                        ou = max(1, ou - get_tick_size(ou))
+                    elif kwargs.get('ord_dv') == '01':  # 매도
+                        ou = ou + get_tick_size(ou)
+                    kwargs['ord_unpr'] = str(ou)
+                    continue  # 즉시 다음 루프(보정 가격으로 재시도)
+                except Exception:
+                    pass
             if not self._is_transient_error(res):
                 return res
             if attempt < max_retries:
@@ -510,7 +547,10 @@ class Trader:
                     "qty": filled_qty if filled_qty > 0 else quantity,
                     "price": current_price, "trade_status": trade_status,
                     "strategy_details": {"reason": reason_text, "reason_code": reason_code, "broker_msg": result.get('msg1')}
-                }), key=f"phase:rebalance_sell:{ticker}", cooldown=30)
+                }), key=f"phase:rebalance_sell:{ticker}:{self.run_id}", cooldown=30)
+
+                # ✅ 매도 통계 반영
+                self.stats["sell"] += 1
 
                 # 응답 실패지만 체결 확인 포함 → 쿨다운 금지 & 실패 카운터 리셋
                 self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=False)
@@ -534,7 +574,7 @@ class Trader:
                     "side": "SELL", "name": name, "ticker": ticker,
                     "qty": quantity, "price": current_price, "trade_status": "failed",
                     "strategy_details": {"error": err, "reason_code": reason_code}
-                }), key=f"phase:rebalance_sell_fail:{ticker}", cooldown=30)
+                }), key=f"phase:rebalance_sell_fail:{ticker}:{self.run_id}", cooldown=30)
 
                 # 연속 실패 누적 → 기준치 도달 시에만 쿨다운
                 self._maybe_add_cooldown(ticker, "리밸런스 매도 주문 실패", increment_fail=True)
@@ -549,8 +589,10 @@ class Trader:
             logger.info(f"  -> [모의] REBALANCE SELL {name}({ticker}) x{quantity}")
             _notify_text(
                 f" [모의] REBALANCE SELL {name}({ticker}) x{quantity}",
-                key=f"phase:paper_rebalance_sell:{ticker}", cooldown=30
+                key=f"phase:paper_rebalance_sell:{ticker}:{self.run_id}", cooldown=30
             )
+            # ✅ 매도 통계 반영(모의)
+            self.stats["sell"] += 1
             return {"status": "executed", "filled_qty": quantity, "rt_cd": "0", "msg1": "paper"}
 
     # ── 점수 캐시 로드 ────────────────────────────────────────────────
@@ -716,14 +758,12 @@ class Trader:
             return False
 
         logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty} @ {order_price:,}")
-        self.stats["buy"] += 1
 
         if self.is_real_trading:
             res = self._order_cash_retry(
                 ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(qty), ord_unpr=str(int(order_price))
             )
             time.sleep(2)
-            self._update_account_info(force=True)
             if not res.get("ok"):
                 err = res.get("msg1", "Unknown error")
                 record_trade({
@@ -735,11 +775,13 @@ class Trader:
                     "side": "BUY", "name": name, "ticker": ticker,
                     "qty": qty, "price": order_price, "trade_status": "failed",
                     "strategy_details": {"error": err, "batch": batch_name}
-                }), key=f"phase:buy_fail:{ticker}", cooldown=30)
+                }), key=f"phase:buy_fail:{ticker}:{self.run_id}", cooldown=30)
                 # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                 self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=True)
                 return False
 
+            # ✅ 성공 경로에서만 계좌 갱신
+            self._update_account_info(force=True)
             record_trade({
                 "side": "buy", "ticker": ticker, "name": name,
                 "qty": qty, "price": order_price, "trade_status": "submitted",
@@ -749,7 +791,9 @@ class Trader:
                 "side": "BUY", "name": name, "ticker": ticker,
                 "qty": qty, "price": order_price, "trade_status": "submitted",
                 "strategy_details": {"broker_msg": res.get('msg1'), "batch": batch_name}
-            }), key=f"phase:buy_single:{ticker}", cooldown=30)
+            }), key=f"phase:buy_success:{ticker}:{self.run_id}", cooldown=30)
+            # ✅ 매수 통계 반영(성공/제출 시)
+            self.stats["buy"] += 1
             # 성공 시 실패카운트 리셋
             self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
             return True
@@ -761,8 +805,10 @@ class Trader:
             })
             _notify_text(
                 f" [모의] BUY {name}({ticker}) x{qty} @ {order_price:,} [{batch_name}]",
-                key=f"phase:paper_buy_single:{ticker}", cooldown=30
+                key=f"phase:paper_buy_single:{ticker}:{self.run_id}", cooldown=30
             )
+            # ✅ 매수 통계 반영(모의)
+            self.stats["buy"] += 1
             return True
 
     # ── 매도 로직 ────────────────────────────────────────────────────
@@ -897,7 +943,10 @@ class Trader:
                             "reason_code": reason_code,
                             "broker_msg": result.get('msg1')
                         }
-                    }), key=f"phase:sell:{ticker}", cooldown=30)
+                    }), key=f"phase:sell:{ticker}:{self.run_id}", cooldown=30)
+
+                    # ✅ 매도 통계 반영
+                    self.stats["sell"] += 1
 
                     # 성공/체결확인 → 실패카운트 리셋
                     self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=False)
@@ -923,7 +972,7 @@ class Trader:
                         "side": "SELL", "name": name, "ticker": ticker,
                         "qty": quantity, "price": current_price, "trade_status": "failed",
                         "strategy_details": {"error": err, "reason_code": reason_code}
-                    }), key=f"phase:sell_fail:{ticker}", cooldown=30)
+                    }), key=f"phase:sell_fail:{ticker}:{self.run_id}", cooldown=30)
                     # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                     self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=True)
 
@@ -937,13 +986,28 @@ class Trader:
                 })
                 _notify_text(
                     f" [모의] SELL {name}({ticker}) x{quantity} | {reason_code}",
-                    key=f"phase:paper_sell:{ticker}", cooldown=30
+                    key=f"phase:paper_sell:{ticker}:{self.run_id}", cooldown=30
                 )
+                # ✅ 매도 통계 반영(모의)
+                self.stats["sell"] += 1
                 self._add_to_cooldown(ticker, "모의 매도 완료")
 
         if executed_sell:
             time.sleep(5)
             self._update_account_info(force=True)
+
+    # ── (도우미) 현금 기반 슬롯 계산 ──────────────────────────────────
+    def _compute_effective_slots(self, cash: int) -> int:
+        """
+        auto_shrink_slots 구성에 따라 현금으로 가능한 슬롯 수를 계산.
+        - 기본: max_positions
+        - auto_shrink_slots=True 이고 min_order_cash>0 인 경우: cash // min_order_cash 와의 최솟값
+        """
+        eff_slots_cap = int(self.trading_params.get("max_positions", self.max_positions))
+        if self.trading_guards.get("auto_shrink_slots", False) and self.min_order_cash > 0:
+            eff_slots_by_cash = max(cash // self.min_order_cash, 0)
+            return min(eff_slots_cap, eff_slots_by_cash)
+        return eff_slots_cap
 
     # ── 매수 로직 ─────────────────────────────────────────────────────
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):
@@ -953,14 +1017,12 @@ class Trader:
         if not in_time_windows(now_kst, self.buy_time_windows):
             logger.info(f"현재 시간 {now_kst.strftime('%H:%M')}은 매수 시간대가 아닙니다. buy_time_windows={self.buy_time_windows}")
             _notify_text("ℹ️ 매수 시간대 외 → 매수 스킵",
-                         key="phase:buy_out_of_window", cooldown=300)
+                         key=f"phase:buy_out_of_window:{self.run_id}", cooldown=300)
             return
 
-        # 동적 슬롯 축소
+        # 동적 슬롯 축소 (초기 계산)
         if self.trading_guards.get("auto_shrink_slots", False):
-            eff_slots_cap = int(self.trading_params.get("max_positions", self.max_positions))
-            eff_slots_by_cash = max(available_cash // max(1, self.min_order_cash), 0) if self.min_order_cash > 0 else eff_slots_cap
-            effective_slots = min(eff_slots_cap, eff_slots_by_cash)
+            effective_slots = self._compute_effective_slots(available_cash)
         else:
             effective_slots = self.max_positions
 
@@ -969,24 +1031,17 @@ class Trader:
         if not trade_plan_file:
             logger.info("매수 계획 파일(gpt_trades_*.json)이 없어 매수를 건너뜁니다.")
             _notify_text("ℹ️ gpt_trades 파일 없음 → 매수 스킵",
-                         key="phase:no_trades", cooldown=600)
-            return
-
-        with open(trade_plan_file, 'r', encoding='utf-8') as f:
-            trade_plans = json.load(f)
-
-        buy_plans = [p for p in trade_plans if p.get("결정") == "매수"]
-        if not buy_plans:
-            logger.info("매수 결정이 내려진 종목이 없습니다.")
-            _notify_text("ℹ️ 매수 결정된 종목 없음",
-                         key="phase:no_buy", cooldown=300)
-            return
-
-        # 안전 디폴트 주입
-        for p in buy_plans:
-            p.setdefault("stock_info", {})
-            for k, dv in SCHEMA_DEFAULTS.items():
-                p["stock_info"].setdefault(k, dv)
+                         key=f"phase:no_trades:{self.run_id}", cooldown=600)
+            # gpt 트레이드가 없어도 리밸런스는 동작하도록 진행(신규 타겟은 all_stock_data 기반)
+        else:
+            with open(trade_plan_file, 'r', encoding='utf-8') as f:
+                trade_plans = json.load(f)
+            buy_plans = [p for p in trade_plans if p.get("결정") == "매수"]
+            # 안전 디폴트 주입
+            for p in buy_plans:
+                p.setdefault("stock_info", {})
+                for k, dv in SCHEMA_DEFAULTS.items():
+                    p["stock_info"].setdefault(k, dv)
 
         # 1차 후보(가성비) 판단: **주가 vs (현금×(1-버퍼))**만 적용
         buffer = float(self.trading_params.get("cash_buffer_ratio", 0.0))
@@ -1012,42 +1067,45 @@ class Trader:
                 time.sleep(3)
                 self._update_account_info(force=True)
                 available_cash, holdings, _ = self._load_snapshot()
+                # 슬롯 재계산
+                effective_slots = self._compute_effective_slots(available_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
 
         # 보유 집합
         holding_tickers = {str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0}
 
-        # 후보 분리: 신규 / 추가매수
+        # 후보 분리: 신규 / 추가매수 (gpt 계획이 있을 경우에만 사용)
         new_targets = []
         rebuy_candidates = []
-        for plan in buy_plans:
-            info = plan["stock_info"]
-            ticker = str(info.get("Ticker", "")).zfill(6)
-            name = info.get("Name", "N/A")
+        if trade_plan_file:
+            for plan in buy_plans:
+                info = plan["stock_info"]
+                ticker = str(info.get("Ticker", "")).zfill(6)
+                name = info.get("Name", "N/A")
 
-            if ticker in holding_tickers:
-                if not self.allow_rebuy:
-                    logger.info(f"[{name}({ticker})] 이미 보유 → 추가매수 비활성이라 제외")
-                    continue
-                if self._is_in_cooldown(ticker):
-                    logger.info(f"[{name}({ticker})] 쿨다운 중 → 추가매수 제외")
-                    continue
-                ok, why = self._can_rebuy(ticker, info, holdings, available_cash)
-                if not ok:
-                    logger.info(f"[REBUY-블록] {name}({ticker}) 제외: {why}")
-                    continue
-                logger.info(f"[REBUY] {name}({ticker}) 추가매수 후보 등록 ({why})")
-                rebuy_candidates.append(plan)
-            else:
-                if self._is_in_cooldown(ticker):
-                    logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
-                    continue
-                new_targets.append(plan)
+                if ticker in holding_tickers:
+                    if not self.allow_rebuy:
+                        logger.info(f"[{name}({ticker})] 이미 보유 → 추가매수 비활성이라 제외")
+                        continue
+                    if self._is_in_cooldown(ticker):
+                        logger.info(f"[{name}({ticker})] 쿨다운 중 → 추가매수 제외")
+                        continue
+                    ok, why = self._can_rebuy(ticker, info, holdings, available_cash)
+                    if not ok:
+                        logger.info(f"[REBUY-블록] {name}({ticker}) 제외: {why}")
+                        continue
+                    logger.info(f"[REBUY] {name}({ticker}) 추가매수 후보 등록 ({why})")
+                    rebuy_candidates.append(plan)
+                else:
+                    if self._is_in_cooldown(ticker):
+                        logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
+                        continue
+                    new_targets.append(plan)
 
         remaining_cash = available_cash
         any_order_placed = False
 
         def _execute_buy_batch(plans: List[Dict], batch_name: str):
-            nonlocal remaining_cash, any_order_placed
+            nonlocal remaining_cash, any_order_placed, effective_slots
             if not plans:
                 return
             if remaining_cash <= max(self.min_order_cash, self.min_cash_reserve):
@@ -1055,13 +1113,19 @@ class Trader:
                 return
 
             _notify_text(f" {batch_name} 매수 시도 {len(plans)}종목 (예산 {remaining_cash:,}원)",
-                         key=f"phase:{batch_name.lower()}_start", cooldown=120)
+                         key=f"phase:{batch_name.lower()}_start:{self.run_id}", cooldown=120)
             logger.info(f"총 {len(plans)}개 종목 {batch_name} 매수 시도. 유동적 예산 배분 + 버퍼 적용.")
 
             for i, plan in enumerate(plans):
-                info = plan["stock_info"]
-                ticker, name = str(info["Ticker"]).zfill(6), info.get("Name", "N/A")
+                info = plan.get("stock_info", {})
+                for k, dv in SCHEMA_DEFAULTS.items():  # 안전 디폴트
+                    info.setdefault(k, dv)
+                ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
                 slots_left = len(plans) - i
+
+                # 최신 현금 기준으로 슬롯 사용량 재평가
+                if self.trading_guards.get("auto_shrink_slots", False):
+                    effective_slots = self._compute_effective_slots(remaining_cash)
 
                 slot_cash = remaining_cash // max(1, slots_left if effective_slots <= 0 else min(slots_left, effective_slots))
                 budget_for_this_stock = int(slot_cash * (1 - buffer))
@@ -1081,7 +1145,7 @@ class Trader:
                             "side": "BUY", "name": name, "ticker": ticker,
                             "qty": 0, "price": 0, "trade_status": "skipped",
                             "strategy_details": {"reason_code": "PRICE_FETCH_FAILED", "batch": batch_name}
-                        }), key=f"phase:buy_skip_price:{ticker}", cooldown=120)
+                        }), key=f"phase:buy_skip_price:{ticker}:{self.run_id}", cooldown=120)
                         continue
 
                 tick_size = get_tick_size(current_price)
@@ -1103,10 +1167,10 @@ class Trader:
                             "available": int(budget_for_this_stock),
                             "batch": batch_name
                         }
-                    }), key=f"phase:buy_insufficient:{ticker}", cooldown=120)
+                    }), key=f"phase:buy_insufficient:{ticker}:{self.run_id}", cooldown=120)
                     continue
 
-                pre_qty = self._get_qty(holdings, ticker)
+                pre_qty = 0  # 신규/리밸런스에서는 0 기준
                 logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,.0f}원 [{batch_name}]")
 
                 if self.is_real_trading:
@@ -1114,13 +1178,15 @@ class Trader:
                         ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(quantity), ord_unpr=str(int(order_price))
                     )
 
-                    time.sleep(2)
-                    self._update_account_info(force=True)
-                    new_cash, holdings_after, _ = self._load_snapshot()
-                    post_qty = self._get_qty(holdings_after, ticker)
-                    qty_delta = max(0, post_qty - pre_qty)
+                    if result.get('ok'):
+                        time.sleep(2)
+                        # ✅ 성공 경로에서만 계좌 갱신/체결수 확인
+                        self._update_account_info(force=True)
+                        new_cash, holdings_after, _ = self._load_snapshot()
+                        post_qty = self._get_qty(holdings_after, ticker)
+                        qty_delta = max(0, post_qty - pre_qty)
 
-                    if result.get('ok') or qty_delta > 0:
+                        # ✅ 매수 통계 반영
                         self.stats["buy"] += 1
                         trade_status = "completed" if qty_delta > 0 else "submitted"
                         record_trade({
@@ -1139,7 +1205,7 @@ class Trader:
                             "qty": qty_delta if qty_delta > 0 else quantity,
                             "price": order_price, "trade_status": trade_status,
                             "strategy_details": {"broker_msg": result.get('msg1'), "batch": batch_name}
-                        }), key=f"phase:buy:{ticker}", cooldown=30)
+                        }), key=f"phase:buy_success:{ticker}:{self.run_id}", cooldown=30)
                         # 성공/체결확인 → 실패 카운트 리셋
                         self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
                     else:
@@ -1161,13 +1227,14 @@ class Trader:
                             "side": "BUY", "name": name, "ticker": ticker, "qty": quantity,
                             "price": order_price, "trade_status": "failed",
                             "strategy_details": {"error": err, "reason_code": "BROKER_REJECT", "batch": batch_name}
-                        }), key=f"phase:buy_fail:{ticker}", cooldown=30)
+                        }), key=f"phase:buy_fail:{ticker}:{self.run_id}", cooldown=30)
                         # 연속 실패 누적 → 기준 도달 시에만 쿨다운
                         self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=True)
                 else:
                     actual_spent = quantity * order_price
                     remaining_cash -= actual_spent
                     any_order_placed = True
+                    # ✅ 매수 통계 반영(모의)
                     self.stats["buy"] += 1
                     record_trade({
                         "side": "buy", "ticker": ticker, "name": name,
@@ -1178,7 +1245,7 @@ class Trader:
                     logger.info(f"  -> [모의] {name}({ticker}) {quantity}주 @{order_price:,.0f}원 지정가 매수 실행. [{batch_name}]")
                     _notify_text(
                         f" [모의] BUY {name}({ticker}) x{quantity} @ {order_price:,.0f} [{batch_name}]",
-                        key=f"phase:paper_buy:{ticker}", cooldown=30
+                        key=f"phase:paper_buy:{ticker}:{self.run_id}", cooldown=30
                     )
 
                 logger.info(f"  -> 남은 예산: {remaining_cash:,.0f}원")
@@ -1191,79 +1258,134 @@ class Trader:
         current_slots_used = len({str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0})
         slots_to_fill = max(0, effective_slots - current_slots_used)
 
-        if slots_to_fill <= 0 and new_targets:
+        if slots_to_fill <= 0:
             # 보유 최저 점수 vs 신규 후보 비교 → 교체(리밸런싱)
-            to_buy_plans, to_sell_list = self._determine_rebalance_swaps(new_targets, holdings)
+            to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)  # gpt 없음 시 내부 점수/보유 기반
             if to_sell_list:
-                _notify_text(f" 리밸런싱 매도 {len(to_sell_list)}건 실행", key="phase:rebalance_sell_batch", cooldown=120)
+                # ── 정책1: 스왑 전 시뮬레이션 ───────────────────────────
+                expected_proceeds = 0
+                # est_proceeds가 없으면 보유 목록에서 추정
+                h_pr_map = {str(h.get("pdno", "")).zfill(6): (_to_int(h.get("prpr", 0)), _to_int(h.get("hldg_qty", 0))) for h in holdings}
                 for s in to_sell_list:
-                    # SELL 하드 게이트
-                    sell_res = self._execute_market_sell(
-                        ticker=s["ticker"],
-                        quantity=s["qty"],
-                        name=s["name"],
-                        reason_text=f"REBALANCE_SWAP (old={s['old_score']:.3f} → new={s['new_score']:.3f} for {s['new_ticker']})",
-                        reason_code="REBALANCE_SWAP"
-                    )
-                    time.sleep(0.5)
+                    t = s["ticker"]
+                    qty = int(s["qty"])
+                    if "est_proceeds" in s:
+                        expected_proceeds += int(s["est_proceeds"])
+                    else:
+                        pr, _ = h_pr_map.get(t, (0, 0))
+                        expected_proceeds += pr * qty
 
-                time.sleep(3)
-                self._update_account_info(force=True)
-                new_cash, holdings_after, _ = self._load_snapshot()
-                slots_now = max(0, effective_slots - len(holdings_after))
-                if slots_now > 0:
-                    buy_now = to_buy_plans[:slots_now]
-                    _execute_buy_batch(buy_now, batch_name="REBALANCE_NEW")
+                expected_cash = int(available_cash + expected_proceeds)
+                eff_after = self._compute_effective_slots(expected_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
+                slots_after = max(0, eff_after - (current_slots_used - len(to_sell_list)))
+
+                # 최소 한 종목이라도 매수 가능할지(버퍼/최소주문 고려) 점검
+                feasible_buy = False
+                if to_buy_plans:
+                    first = to_buy_plans[0]
+                    info = first.get("stock_info", {})
+                    for k, dv in SCHEMA_DEFAULTS.items():
+                        info.setdefault(k, dv)
+                    px = _to_int(info.get("Price", 0))
+                    budget_after = int(expected_cash * (1 - buffer))
+                    qty1 = budget_after // px if px > 0 else 0
+                    feasible_buy = (px > 0) and (qty1 >= 1) and ((self.min_order_cash <= 0) or (qty1 * px >= self.min_order_cash))
+
+                logger.info(
+                    f"[SWAP-SIM] expected_cash={expected_cash:,}, eff_slots_after={eff_after}, "
+                    f"slots_after={slots_after}, feasible_buy={'YES' if feasible_buy else 'NO'}"
+                )
+
+                if slots_after < 1 or not feasible_buy:
+                    logger.info("스왑 사전 시뮬레이션 결과: 매수 불가 혹은 슬롯 부족 → 리밸런스 매도 전체 취소.")
+                    _notify_text("⚠️ 리밸런스 취소: 매수 불가/슬롯 부족(정책1 시뮬레이션)", key=f"phase:rebalance_sim_cancel:{self.run_id}", cooldown=120)
+                else:
+                    _notify_text(f" 리밸런싱 매도 {len(to_sell_list)}건 실행", key=f"phase:rebalance_sell_batch:{self.run_id}", cooldown=120)
+                    for s in to_sell_list:
+                        sell_res = self._execute_market_sell(
+                            ticker=s["ticker"],
+                            quantity=s["qty"],
+                            name=s["name"],
+                            reason_text=f"REBALANCE_SWAP (old={s['old_score']:.3f} → new={s['new_score']:.3f} for {s['new_ticker']})",
+                            reason_code="REBALANCE_SWAP"
+                        )
+                        time.sleep(0.5)
+
+                    # 매도 후 최신 잔고/현금 재조회 및 슬롯 재계산
+                    time.sleep(3)
+                    self._update_account_info(force=True)
+                    new_cash, holdings_after, _ = self._load_snapshot()
+                    eff_now = self._compute_effective_slots(new_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
+                    slots_now = max(0, eff_now - len(holdings_after))
+
+                    logger.info(f"[SWAP-AFTER] new_cash={new_cash:,}, eff_slots_now={eff_now}, slots_now={slots_now}")
+                    if slots_now > 0:
+                        buy_now = to_buy_plans[:slots_now]
+                        _execute_buy_batch(buy_now, batch_name="REBALANCE_NEW")
+                    else:
+                        logger.info("리밸런스 이후에도 신규 슬롯이 없어 매수 생략.")
+                        _notify_text("ℹ️ 리밸런스 후 신규 슬롯 0 → 매수 생략", key=f"phase:rebalance_no_slots_after:{self.run_id}", cooldown=120)
             else:
                 logger.info("리밸런싱 기준을 충족하는 교체 대상이 없어 신규 매수는 생략합니다.")
 
         else:
-            if slots_to_fill <= 0:
-                logger.info(f"신규 매수 슬롯이 없습니다 (effective_slots={effective_slots}, 현재보유={current_slots_used}).")
-                _notify_text(f"ℹ️ 신규 매수 슬롯 없음 (effective_slots={effective_slots}, curr={current_slots_used})",
-                             key="phase:no_slots", cooldown=300)
+            targets_to_buy = new_targets[:slots_to_fill] if trade_plan_file else []
+            if not targets_to_buy:
+                logger.info("신규로 매수할 최종 대상이 없습니다.")
+                _notify_text("ℹ️ 신규 매수 대상 없음",
+                             key=f"phase:no_targets:{self.run_id}", cooldown=300)
             else:
-                targets_to_buy = new_targets[:slots_to_fill]
-                if not targets_to_buy:
-                    logger.info("신규로 매수할 최종 대상이 없습니다.")
-                    _notify_text("ℹ️ 신규 매수 대상 없음",
-                                 key="phase:no_targets", cooldown=300)
-                else:
-                    _execute_buy_batch(targets_to_buy, batch_name="NEW")
+                _execute_buy_batch(targets_to_buy, batch_name="NEW")
 
         if any_order_placed:
             time.sleep(5)
             self._update_account_info(force=True)
 
-    # ── 리밸런싱 페어링 (점수 기반) ───────────────────────────────────
+    # ── 리밸런싱 페어링 (점수 기반 + Δscore 임계치) ───────────────────
     def _determine_rebalance_swaps(self, new_targets: List[Dict], holdings: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         scores_map, score_file = self._load_latest_scores()
         if not scores_map:
             logger.info("리밸런싱 건너뜀: 점수 캐시 없음.")
             return [], []
 
-        held: List[Tuple[str, str, int, float]] = []
+        # 보유 (ticker, name, qty, score, prpr)
+        held: List[Tuple[str, str, int, float, int]] = []
         for h in holdings:
             t = str(h.get("pdno", "")).zfill(6)
             nm = h.get("prdt_name", "N/A")
             qty = _to_int(h.get("hldg_qty", 0))
             sc = float(scores_map.get(t, 0.0))
+            pr = _to_int(h.get("prpr", 0))
             if qty > 0:
-                held.append((t, nm, qty, sc))
+                held.append((t, nm, qty, sc, pr))
         if not held:
             return [], []
 
+        # 신규 후보: (score, plan) — gpt 기반이 없으면 all_stock_data 상위 점수를 사용
         new_list: List[Tuple[float, Dict]] = []
-        for plan in new_targets:
-            info = plan.get("stock_info", {})
-            sc = _to_float(info.get("Score"), 0.0)
-            new_list.append((float(sc), plan))
+        if new_targets:
+            for plan in new_targets:
+                info = plan.get("stock_info", {})
+                sc = _to_float(info.get("Score"), 0.0)
+                new_list.append((float(sc), plan))
+        else:
+            # all_stock_data에서 점수 높은 상위 후보 구성
+            tmp = []
+            for t, rec in self.all_stock_data.items():
+                sc = _to_float(rec.get("Score"), 0.0)
+                if sc > 0:
+                    tmp.append((sc, {
+                        "stock_info": rec
+                    }))
+            new_list = sorted(tmp, key=lambda x: x[0], reverse=True)[:max(1, len(held))]
 
         if not new_list:
             return [], []
 
-        held_sorted = sorted(held, key=lambda x: x[3])
-        new_sorted = sorted(new_list, key=lambda x: x[0], reverse=True)
+        held_sorted = sorted(held, key=lambda x: x[3])              # 점수 오름차순(최약체 우선)
+        new_sorted = sorted(new_list, key=lambda x: x[0], reverse=True)  # 후보 고점수 우선
+
+        delta_thr = float(self.settings.get("rotation", {}).get("delta_score_min", 0.10))
 
         to_buy: List[Dict] = []
         to_sell: List[Dict] = []
@@ -1272,8 +1394,9 @@ class Trader:
         for new_score, plan in new_sorted:
             if hi >= len(held_sorted):
                 break
-            worst_t, worst_name, worst_qty, worst_score = held_sorted[hi]
-            if new_score > worst_score:
+            worst_t, worst_name, worst_qty, worst_score, worst_pr = held_sorted[hi]
+            if new_score >= (worst_score + delta_thr):  # ✅ Δscore 임계치 적용
+                info = plan.get("stock_info", {})
                 to_buy.append(plan)
                 to_sell.append({
                     "ticker": worst_t,
@@ -1281,12 +1404,17 @@ class Trader:
                     "qty": worst_qty,
                     "old_score": worst_score,
                     "new_score": new_score,
-                    "new_ticker": str(plan.get("stock_info", {}).get("Ticker", "")).zfill(6),
+                    "new_ticker": str(info.get("Ticker", "")).zfill(6),
+                    "est_proceeds": int(worst_pr * worst_qty)
                 })
                 hi += 1
+            else:
+                # 임계치 못 넘으면 더 이상 교체 진행 X (보수적)
+                break
+
         if to_buy and to_sell:
             pairs = len(to_buy)
-            msg_lines = [f"점수 기반 리밸런싱 매칭 {pairs}건"]
+            msg_lines = [f"점수 기반 리밸런싱 매칭 {pairs}건 (Δ≥{delta_thr:.2f})"]
             for i in range(pairs):
                 s = to_sell[i]
                 new_plan = to_buy[i]
@@ -1295,9 +1423,9 @@ class Trader:
                 msg_lines.append(
                     f"- SELL {s['name']}({s['ticker']}) [{s['old_score']:.3f}]  →  BUY {nn}({nt}) [{s['new_score']:.3f}]"
                 )
-            _notify_text(" " + "\n".join(msg_lines), key="phase:rebalance_pairs", cooldown=120)
+            _notify_text(" " + "\n".join(msg_lines), key=f"phase:rebalance_pairs:{self.run_id}", cooldown=120)
         else:
-            logger.info("리밸런싱 조건을 만족하는 신규 후보가 없습니다.")
+            logger.info(f"리밸런싱 조건(Δ≥{delta_thr:.2f})을 만족하는 신규 후보가 없습니다.")
         return to_buy, to_sell
 
     # ── 쿨다운 관리 ───────────────────────────────────────────────────
@@ -1321,7 +1449,7 @@ class Trader:
         self._save_cooldown_list()
         logger.info(f"[{ticker}] {reason}으로 인해 쿨다운 목록에 추가. ({end_date}까지)")
         _notify_text(f"⛔ {ticker} 쿨다운 등록: {reason} (until {end_date[:19]})",
-                     key=f"phase:cooldown:{ticker}", cooldown=60)
+                     key=f"phase:cooldown:{ticker}:{self.run_id}", cooldown=60)
 
     def _is_in_cooldown(self, ticker: str) -> bool:
         if ticker not in self.cooldown_list:
@@ -1348,7 +1476,7 @@ class Trader:
         logger.info(line1)
         logger.info(line2)
         if self.reporting.get("coherent_summary", False):
-            _notify_text(f"✅ 파이프라인 요약\n{line1}\n{line2}", key="phase:summary", cooldown=60)
+            _notify_text(f"✅ 파이프라인 요약\n{line1}\n{line2}", key=f"phase:summary:{self.run_id}", cooldown=60)
 
 # ── 엔트리포인트 ─────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -1384,15 +1512,19 @@ if __name__ == "__main__":
         trader.run_buy_logic(cash1, holdings1)
 
         logger.info("모든 트레이딩 로직 실행 완료.")
-        _notify_text("✅ 트레이딩 로직 실행 완료", key="phase:done", cooldown=60)
+        _notify_text("✅ 트레이딩 로직 실행 완료", key=f"phase:done:{trader.run_id}", cooldown=60)
 
         # 최종 요약
         trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
 
+        # 종료 시점 간단 상태 로그(참고용)
+        cash_end, holdings_end, _ = trader.get_account_info_from_files()
+        logger.info(f"[END] 보유: {len(holdings_end)}개, 예수금: {cash_end:,}원")
+
     except Exception as e:
         logger.critical(f"트레이더 실행 중 심각한 오류 발생: {e}", exc_info=True)
         _notify_text(f" 트레이더 치명적 오류: {str(e)[:1800]}",
-                     key="phase:fatal", cooldown=30)
+                     key=f"phase:fatal:{os.getenv('RUN_ID','na')}", cooldown=30)
         try:
             trader._set_summary_reason("FATAL_EXCEPTION", str(e))
             trader.emit_final_summary(start_ts, status="FAILED", warnings=1)

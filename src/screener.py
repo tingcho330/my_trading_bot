@@ -11,6 +11,7 @@ from typing import Dict, Optional, List, Any, Tuple
 from pathlib import Path
 import threading
 from collections import defaultdict
+import random
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,9 @@ from utils import (
 
 # ─────── 스키마 메타 ───────
 SCHEMA_VERSION = "1.2"  # Output schema pinned
+
+# 전역 워커 상한 (폭주 방지)
+MAX_WORKERS_HARD_CAP = int(os.getenv("WORKERS_HARD_CAP", "8"))
 
 # ---- load_config 폴백 (get_cfg가 주력이지만 호환성을 위해 유지) ----
 def _load_config_fallback() -> dict:
@@ -139,6 +143,28 @@ _LISTING_DATES_CACHE: Dict[str, Optional[datetime]] = {}
 _LISTING_PREFETCHED = False
 _LISTING_LOCK = threading.Lock()
 
+# ─────────── KIS 레이트 리미터 ───────────
+class RateLimiter:
+    def __init__(self, rps: float):
+        # rps가 0이면 비활성
+        self.min_interval = 1.0 / max(0.1, float(rps))
+        self._last = 0.0
+        self._lock = threading.Lock()
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+
+_KIS_RATE_LIMITER: Optional[RateLimiter] = None
+_KIS_MAX_CONCURRENCY: int = 2
+
+def _is_kis_ratelimit_error(e: Exception) -> bool:
+    msg = str(e)
+    return ("EGW00201" in msg) or ("초당 거래건수" in msg)
+
 def _parse_listing_date_value(v: Any) -> Optional[datetime]:
     """KIS 응답의 다양한 상장일 필드를 datetime으로 변환"""
     if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -185,12 +211,21 @@ def _extract_listing_date_from_kis_df(df: pd.DataFrame) -> Optional[datetime]:
             return dt
     return None
 
-def _kis_inquire_price_safe(kis: KIS, code: str) -> Optional[pd.DataFrame]:
-    try:
-        return kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
-    except Exception as e:
-        logger.debug("KIS inquire_price 실패(%s): %s", code, e)
-        return None
+def _kis_inquire_price_safe(kis: KIS, code: str, retries: int = 4) -> Optional[pd.DataFrame]:
+    """KIS API 호출(상장일/섹터) - 레이트 리미터 + 지수 백오프"""
+    code = str(code).zfill(6)
+    for attempt in range(max(1, retries)):
+        try:
+            if _KIS_RATE_LIMITER:
+                _KIS_RATE_LIMITER.wait()
+            return kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=code)
+        except Exception as e:
+            if _is_kis_ratelimit_error(e) and attempt < retries - 1:
+                backoff = min(1.0 * (attempt + 1), 3.0) + random.uniform(0, 0.25)
+                time.sleep(backoff)
+                continue
+            logger.debug("KIS inquire_price 실패(%s): %s", code, e)
+            return None
 
 # === 신규 추가: 공개 API ===
 def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, workers: int = 4) -> None:
@@ -230,15 +265,17 @@ def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, wor
         return
 
     logger.info("상장일(KIS) 일괄 조회 시작 (대상 %d종목)", len(targets))
+
     def _fetch(code: str) -> Tuple[str, Optional[datetime]]:
         df = _kis_inquire_price_safe(kis, code)
         dt = _extract_listing_date_from_kis_df(df) if df is not None else None
         return code, dt
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+    actual_workers = max(1, min(workers, _KIS_MAX_CONCURRENCY))
+    done = 0
+    with ThreadPoolExecutor(max_workers=actual_workers) as ex:
         futs = {ex.submit(_fetch, c): c for c in targets}
         total = len(futs)
-        done = 0
         for i, fut in enumerate(as_completed(futs), start=1):
             code, dt = fut.result()
             with _LISTING_LOCK:
@@ -273,7 +310,7 @@ def get_listing_date(ticker: str) -> Optional[datetime]:
         _LISTING_DATES_CACHE[code] = dt
     return dt
 
-# ─────────── 스코어링 실패 집계 ───────────
+# ─────────── 스코어링 실패/스킵 집계 ───────────
 _fail_stats = defaultdict(int)
 _fail_rows: List[Dict[str, Any]] = []
 _fail_lock = threading.Lock()
@@ -470,7 +507,7 @@ def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = N
 
     def _fetch_one(code: str) -> Tuple[str, str]:
         try:
-            df = kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=str(code).zfill(6))
+            df = _kis_inquire_price_safe(kis, code)
             if df is not None and not df.empty:
                 sec = _extract_sector_from_kis_df(df)
                 return (str(code).zfill(6), _normalize_sector_name(sec) if sec else "N/A")
@@ -480,7 +517,8 @@ def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = N
             return (str(code).zfill(6), "N/A")
 
     sectors: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+    actual_workers = max(1, min(workers, _KIS_MAX_CONCURRENCY))
+    with ThreadPoolExecutor(max_workers=actual_workers) as ex:
         futs = {ex.submit(_fetch_one, c): c for c in codes}
         total = len(codes)
         for i, fut in enumerate(as_completed(futs), start=1):
@@ -685,8 +723,8 @@ def _apply_sector_source_order(
         if len(missing_idx) == 0:
             break
         if src == "pykrx":
-            # 설정 임계값(환경변수→config 우선 순서)
-            cfg_threshold = 5
+            # 기본 임계치 100으로 상향 (부분 매핑 우선)
+            cfg_threshold = 100
             try:
                 cfg_threshold = int(get_cfg().get("screener_params", {}).get("pykrx_sector_min_missing", cfg_threshold))
             except Exception:
@@ -754,6 +792,29 @@ def _resolve_business_date(date_str: str, market: str) -> str:
     logger.warning("직전 거래일 탐지 실패. 원래 날짜를 사용합니다: %s", date_str)
     return date_str
 
+def _safe_concat_mean(series_list: List[pd.Series]) -> pd.Series:
+    """중복 인덱스/형식 불일치에 강한 평균 집계기."""
+    if not series_list:
+        return pd.Series(dtype="float64")
+    cleaned = []
+    for s in series_list:
+        s = pd.to_numeric(s, errors="coerce")
+        # 중복 인덱스는 평균으로 축약
+        if not s.index.is_unique:
+            s = s.groupby(level=0).mean()
+        cleaned.append(s)
+    # 가능한 한 빠르게 outer align
+    try:
+        df = pd.concat(cleaned, axis=1, join="outer", sort=False, copy=False)
+    except ValueError:
+        # 마지막 방어: 인덱스 합집합으로 수동 정렬 후 concat
+        idx = cleaned[0].index
+        for s in cleaned[1:]:
+            idx = idx.union(s.index)
+        aligned = [s.reindex(idx) for s in cleaned]
+        df = pd.concat(aligned, axis=1, join="outer", sort=False, copy=False)
+    return df.mean(axis=1)
+
 def _get_trading_value_5d_avg(date_str: str, market: str) -> pd.Series:
     amounts = []
     dt = datetime.strptime(date_str, "%Y%m%d")
@@ -763,7 +824,8 @@ def _get_trading_value_5d_avg(date_str: str, market: str) -> pd.Series:
         try:
             df = pykrx.get_market_ohlcv_by_ticker(d, market=market)
             if df is not None and not df.empty and "거래대금" in df.columns:
-                amounts.append(_norm_code_index(df)["거래대금"].rename(d).astype("float64"))
+                s = _norm_code_index(df)["거래대금"].rename(d).astype("float64")
+                amounts.append(s)
                 found += 1
         except Exception:
             pass
@@ -772,7 +834,8 @@ def _get_trading_value_5d_avg(date_str: str, market: str) -> pd.Series:
     if not amounts:
         logger.warning("거래대금 5D 계산 실패. 빈 Series 반환.")
         return pd.Series(dtype="float64", name="Amount5D")
-    return pd.concat(amounts, axis=1).mean(axis=1).rename("Amount5D")
+    out = _safe_concat_mean(amounts).rename("Amount5D")
+    return out
 
 def _get_market_regime_score(date_str: str, market: str) -> float:
     index_code = {"KOSPI": "1001", "KOSDAQ": "2001"}.get(market.upper(), "1001")
@@ -986,26 +1049,25 @@ def _calculate_scores_for_ticker(
         if calc_window_days > 0 and len(df_price) > calc_window_days:
             df_price = df_price.tail(calc_window_days)
 
-        # ▶ price_short 방지/기록
+        # --- 신규상장 우선 스킵 ---
+        listing_dt = _LISTING_DATES_CACHE.get(str(code).zfill(6)) or get_listing_date(code)
+        newly_days = int(cfg.get("exclude_newly_listed_days", 60))
+        if listing_dt is not None and newly_days > 0 and is_newly_listed(listing_dt, datetime.now(), newly_days):
+            with _fail_lock:
+                _fail_stats["newly_listed_skip"] += 1
+                _fail_rows.append({"Ticker": code, "reason": "NEWLY_LISTED"})
+            return None
+
+        # ▶ 최소 봉수 미달은 스킵으로 분류
         min_history_bars = int(cfg.get("min_history_bars", 200))
         if df_price is None or len(df_price) < min_history_bars:
             with _fail_lock:
-                _fail_stats["price_short"] += 1
+                _fail_stats["skipped_short_history"] += 1
                 _fail_rows.append({
-                    "Ticker": code, "reason": "price_short",
+                    "Ticker": code, "reason": "INSUFFICIENT_HISTORY",
                     "len": float(len(df_price) if df_price is not None else 0),
                 })
             return None
-
-        # --- 제외 필터 ---
-        exclude_reasons = []
-        # 신규상장 제외 (KIS 캐시 우선)
-        # 요청사항: LISTING_CACHE 우선 → 그 다음 get_listing_date
-        listing_dt = _LISTING_DATES_CACHE.get(str(code).zfill(6)) or get_listing_date(code)
-        newly_days = int(cfg.get("exclude_newly_listed_days", 60))
-        if listing_dt is not None and newly_days > 0:
-            if is_newly_listed(listing_dt, datetime.now(), newly_days):
-                exclude_reasons.append("NEWLY_LISTED")
 
         # 지표 계산
         close_series = df_price["Close"]
@@ -1026,6 +1088,7 @@ def _calculate_scores_for_ticker(
             return None
 
         # 연속 양봉 제외
+        exclude_reasons = []
         try:
             df_price_lower = df_price.rename(str.lower, axis=1)
             if count_consecutive_up(df_price_lower.tail(10)) >= int(cfg.get("exclude_consecutive_up_days", 3)):
@@ -1141,7 +1204,7 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
 
 # ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
-    global _KIS_INSTANCE
+    global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY
     start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
@@ -1150,6 +1213,13 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         logger.setLevel(logging.DEBUG)
 
     ensure_output_dir()
+
+    # 오늘 개장일 여부(로그용)
+    try:
+        open_day = is_market_open_day(datetime.now(KST).date())
+        logger.info("오늘 한국 시장 개장일 여부: %s", "개장" if open_day else "휴장")
+    except Exception:
+        pass
 
     # config 로드 (utils.get_cfg 사용)
     settings = get_cfg()
@@ -1181,6 +1251,13 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
     _KIS_INSTANCE = kis
 
+    # KIS 레이트 리밋/동시성 설정(설정값/환경변수/기본값)
+    kis_limits = settings.get("kis_limits", {})
+    kis_rps = float(kis_limits.get("max_rps", os.getenv("KIS_MAX_RPS", 3)))
+    max_conc = int(kis_limits.get("max_concurrency", os.getenv("KIS_MAX_CONCURRENCY", 2)))
+    _KIS_RATE_LIMITER = RateLimiter(kis_rps) if kis_rps and kis_rps > 0 else None
+    _KIS_MAX_CONCURRENCY = max(1, min(max_conc, 4))  # 하드 안전상한 4
+
     screener_params = settings.get("screener_params", {})
     risk_params = settings.get("risk_params", {})
 
@@ -1211,14 +1288,15 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
-    # ✅ KIS 상장일 사전 캐싱 (로그 1회, 스코어링 전) — 요청명으로 노출
+    # ✅ KIS 상장일 사전 캐싱 (로그 1회, 스코어링 전)
     with stage("상장일(KIS) 프리패치", notify_key=None):
         get_listing_date_kis_prefetch(kis, list(df_filtered.index), fixed_date, workers)
 
     with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         results = []
         total = len(df_filtered)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        actual_workers = max(1, min(workers, MAX_WORKERS_HARD_CAP))
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
             futures = {
                 executor.submit(
                     _calculate_scores_for_ticker,
@@ -1239,11 +1317,15 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 if res:
                     results.append(res)
 
-        # 스코어링 실패 요약 및 CSV 덤프
+        # 스코어링 실패/스킵 요약 및 CSV 덤프
         try:
             if _fail_stats:
                 fail_sum = ", ".join(f"{k}={v}" for k, v in _fail_stats.items())
-                logger.warning("스코어링 실패 요약: %s", fail_sum)
+                only_skips = set(_fail_stats.keys()).issubset({"skipped_short_history", "newly_listed_skip"})
+                if only_skips:
+                    logger.info("스코어링 스킵 요약: %s", fail_sum)
+                else:
+                    logger.warning("스코어링 실패 요약: %s", fail_sum)
                 dbg_dir = OUTPUT_DIR / "debug"
                 dbg_dir.mkdir(parents=True, exist_ok=True)
                 fail_csv = dbg_dir / f"scoring_fail_{fixed_date}_{market}.csv"
@@ -1384,7 +1466,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "date": fixed_date,
             "params": {
                 "min_history_bars": int(screener_params.get("min_history_bars", 200)),
-                "pykrx_sector_min_missing": int(screener_params.get("pykrx_sector_min_missing", 5)),
+                "pykrx_sector_min_missing": int(screener_params.get("pykrx_sector_min_missing", 100)),
                 "affordability_filter_requested": aff_req,
             },
             "files": {
@@ -1436,4 +1518,4 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run_screener(args.date, args.market, args.config, max(1, args.workers), args.debug)
+    run_screener(args.date, args.market, args.config, max(1, min(args.workers, MAX_WORKERS_HARD_CAP)), args.debug)
